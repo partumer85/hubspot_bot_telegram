@@ -97,27 +97,48 @@ async def telegram_webhook(request: Request):
 @app.post("/hubspot/webhook")
 async def hubspot_webhook(request: Request):
     body = await request.json()
-    if not isinstance(body, list):
+    logger.info("Webhook body: %s", body)  # временно — чтобы видеть реальный формат
+
+    # Приводим тело к единому списку событий
+    events = []
+    if isinstance(body, list):
+        events = body  # App Webhooks
+    elif isinstance(body, dict):
+        # Несколько распространённых вариантов
+        if "objectId" in body:
+            events = [body]
+        elif "event" in body and isinstance(body["event"], dict) and "objectId" in body["event"]:
+            events = [body["event"]]
+        elif "id" in body and str(body.get("objectType", "")).lower() in ("deal", "deals"):
+            events = [{"objectId": body["id"], "objectType": "deal"}]
+        else:
+            logger.warning("Unknown webhook payload shape; skipping")
+            return JSONResponse({"ok": True})
+    else:
+        logger.warning("Unexpected payload type; skipping")
         return JSONResponse({"ok": True})
-    for ev in body:
-        try:
-            event = HubSpotEvent(**ev)
-        except Exception:
+
+    # Обрабатываем события
+    for ev in events:
+        deal_id = str(ev.get("objectId") or ev.get("id") or "").strip()
+        if not deal_id:
+            logger.warning("No deal_id in event: %s", ev)
             continue
-        if event.objectType and event.objectType.lower() != "deal":
-            continue
-        deal_id = str(event.objectId)
         try:
             deal = hs_get_deal(deal_id)
             title = deal.get("properties", {}).get("dealname", "(no title)")
             await application.bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
                 text=f"📌 New deal: {title}\nID: {deal_id}",
-                parse_mode=ParseMode.HTML
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
             )
         except Exception:
             logger.exception("Failed to fetch/post deal %s", deal_id)
+
     return JSONResponse({"ok": True})
+
+
 
 @app.get("/")
 async def root():
