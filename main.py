@@ -111,6 +111,13 @@ async def hubspot_webhook(request: Request):
 @app.get("/")
 async def root():
     return {"status": "ok"}
+@app.head("/")
+async def root_head():
+    return JSONResponse({"status": "ok"})
+
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok"}
 
 if __name__ == "__main__":
     import uvicorn
