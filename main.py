@@ -60,6 +60,17 @@ async def assign_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 application.add_handler(CommandHandler("assign", assign_cmd))
 
 app = FastAPI()
+async def posttest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await application.bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text="🔧 Test post to TELEGRAM_CHAT_ID"
+        )
+        await update.message.reply_text("✅ Sent to channel")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed: {e}")
+
+application.add_handler(CommandHandler("posttest", posttest_cmd))
 
 class HubSpotEvent(BaseModel):
     objectId: str
@@ -118,6 +129,8 @@ async def root_head():
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
+
+
 
 if __name__ == "__main__":
     import uvicorn
