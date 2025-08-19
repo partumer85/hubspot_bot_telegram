@@ -1,5 +1,6 @@
 import os
 import logging
+import time
 from typing import Optional, Dict, Any
 
 import requests
@@ -28,6 +29,60 @@ HS_HEADERS = {
     "Authorization": f"Bearer {HUBSPOT_TOKEN}",
     "Content-Type": "application/json",
 }
+
+HUBSPOT_OWNERS_CACHE_TTL = int(os.getenv("HUBSPOT_OWNERS_CACHE_TTL", "900"))
+
+# Cache for HubSpot owners: owner_id -> "First Last" (fallbacks to email/id)
+_OWNERS_MAP_CACHE: Dict[str, str] = {}
+_OWNERS_MAP_TS: float = 0.0
+
+def hs_get_owners_map() -> Dict[str, str]:
+    global _OWNERS_MAP_CACHE, _OWNERS_MAP_TS
+    now = time.time()
+    if _OWNERS_MAP_CACHE and (now - _OWNERS_MAP_TS) < HUBSPOT_OWNERS_CACHE_TTL:
+        return _OWNERS_MAP_CACHE
+
+    url = f"{HS_BASE}/crm/v3/owners/"
+    params: Dict[str, Any] = {"archived": "false", "limit": 100}
+    owners_map: Dict[str, str] = {}
+    try:
+        while True:
+            r = requests.get(url, headers=HS_HEADERS, params=params, timeout=15)
+            if not r.ok:
+                break
+            data = r.json() or {}
+            for owner in data.get("results", []) or []:
+                owner_id = str(owner.get("id", "")).strip()
+                if not owner_id:
+                    continue
+                first_name = (owner.get("firstName") or "").strip()
+                last_name = (owner.get("lastName") or "").strip()
+                full_name = (f"{first_name} {last_name}").strip()
+                if not full_name:
+                    full_name = (owner.get("email") or "").strip() or owner_id
+                owners_map[owner_id] = full_name
+            paging = (data.get("paging") or {}).get("next") or {}
+            after = paging.get("after")
+            if after:
+                params["after"] = after
+            else:
+                break
+    except Exception:
+        logger.exception("Failed to fetch owners from HubSpot; using cached/empty map")
+
+    if owners_map:
+        _OWNERS_MAP_CACHE = owners_map
+        _OWNERS_MAP_TS = now
+    return _OWNERS_MAP_CACHE
+
+def render_owner_name(raw_owner_id: Any) -> str:
+    if raw_owner_id is None:
+        return ""
+    owner_id_str = str(raw_owner_id).strip()
+    if not owner_id_str:
+        return ""
+    owners_map = hs_get_owners_map()
+    return owners_map.get(owner_id_str, owner_id_str)
 
 def hs_get_deal(deal_id: str) -> Dict[str, Any]:
     url = f"{HS_BASE}/crm/v3/objects/deals/{deal_id}"
@@ -195,7 +250,11 @@ async def hubspot_webhook(request: Request):
                     continue
                 if isinstance(value, str) and value.strip() == "":
                     continue
-                lines.append(f"{label}: {value}")
+                if prop_key == DEAL_OWNER_PROP:
+                    display_value = render_owner_name(value)
+                else:
+                    display_value = value
+                lines.append(f"{label}: {display_value}")
 
             text = "\n".join(lines)
 
