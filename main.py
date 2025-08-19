@@ -216,7 +216,10 @@ async def schedule_owner_reminder(deal_id: str, owner_id: Any, portal_id: Option
         owner_name = render_owner_name(owner_id)
         mention = render_owner_mention(owner_id, owner_name)
         pid = (portal_id or HUBSPOT_PORTAL_ID or "").strip()
-        deal_link = f"https://app.hubspot.com/contacts/{pid}/deal/{deal_id}" if pid else f"deal id: {deal_id}"
+        if pid:
+            deal_link = f"@https://app.hubspot.com/contacts/{pid}/record/0-3/{deal_id}"
+        else:
+            deal_link = f"deal id: {deal_id}"
         text = f"{mention} напоминаю, что необходимо определить основной пул по сделке\n{deal_link}"
         await application.bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
