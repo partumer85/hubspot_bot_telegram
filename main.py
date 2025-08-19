@@ -115,6 +115,40 @@ def hs_get_deal(deal_id: str) -> Dict[str, Any]:
         raise HTTPException(status_code=502, detail="HubSpot get deal failed")
     return r.json()
 
+def hs_get_deal_file_association_ids_v3(deal_id: str) -> list[str]:
+    url = f"{HS_BASE}/crm/v3/objects/deals/{deal_id}/associations/files"
+    params: Dict[str, Any] = {"limit": 100}
+    file_ids: list[str] = []
+    try:
+        while True:
+            r = requests.get(url, headers=HS_HEADERS, params=params, timeout=15)
+            if not r.ok:
+                logger.warning("Deal->files association fetch failed: %s %s", r.status_code, r.text)
+                break
+            data = r.json() or {}
+            for assoc in data.get("results", []) or []:
+                fid = str(assoc.get("toObjectId") or assoc.get("id") or "").strip()
+                if fid:
+                    file_ids.append(fid)
+            paging = (data.get("paging") or {}).get("next") or {}
+            after = paging.get("after")
+            if after:
+                params["after"] = after
+            else:
+                break
+    except Exception:
+        logger.exception("Failed to fetch file associations for deal %s", deal_id)
+    return file_ids
+
+def hs_get_file(file_id: str) -> Dict[str, Any]:
+    # Files API lives under /files/v3
+    url = f"{HS_BASE}/files/v3/files/{file_id}"
+    r = requests.get(url, headers=HS_HEADERS, timeout=15)
+    if not r.ok:
+        logger.warning("File fetch failed for %s: %s %s", file_id, r.status_code, r.text)
+        raise HTTPException(status_code=502, detail="HubSpot get file failed")
+    return r.json()
+
 def hs_get_company(company_id: str) -> Dict[str, Any]:
     url = f"{HS_BASE}/crm/v3/objects/companies/{company_id}"
     params = {
@@ -304,22 +338,22 @@ async def hubspot_webhook(request: Request):
             if company_name:
                 lines.append(f"company: {company_name}")
 
-            # label -> internal property name
+            # label -> internal property name (russian labels)
             fields_to_render = [
-                ("dealstage", "dealstage"),
-                ("amount", "amount"),
-                ("hubspot_owner_id", DEAL_OWNER_PROP),
-                ("location", DEAL_LOCATION_PROP),
-                ("source_of_deal", "source_of_deal"),
-                ("description", "description"),
-                ("closedate", "closedate"),
-                ("duration", "duration"),
-                ("onsight_remote", "onsight_remote"),
-                ("financial_terms", "financial_terms"),
-                ("hs_next_step", "hs_next_step"),
-                ("to_notify", "to_notify"),
-                ("documents_for_deal", "documents_for_deal"),
-                ("description_of_deal", "description_of_deal"),
+                ("Стадия сделки", "dealstage"),
+                ("Сумма сделки", "amount"),
+                ("Владелец сделки", DEAL_OWNER_PROP),
+                ("Локация", DEAL_LOCATION_PROP),
+                ("Источник сделки", "source_of_deal"),
+                ("Описание сделки", "description"),
+                ("Дата старта", "closedate"),
+                ("Продолжительность проекта", "duration"),
+                ("Формат проекта", "onsight_remote"),
+                ("Финансовые условия", "financial_terms"),
+                ("Следующие шаги", "hs_next_step"),
+                ("Оповестить", "to_notify"),
+                # documents_for_deal - не показываем в основном сообщении
+                ("Комментарии", "description_of_deal"),
             ]
 
             for label, prop_key in fields_to_render:
@@ -336,12 +370,32 @@ async def hubspot_webhook(request: Request):
 
             text = "\n".join(lines)
 
-            await application.bot.send_message(
+            message = await application.bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
                 text=text,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
+
+            # If there are any files associated with the deal, forward them afterwards
+            try:
+                file_ids = hs_get_deal_file_association_ids_v3(deal_id)
+                for fid in file_ids:
+                    try:
+                        file_meta = hs_get_file(fid)
+                        file_url = file_meta.get("url") or file_meta.get("urlFull")
+                        if not file_url:
+                            continue
+                        # Send as a simple link (uploading requires public URL/stream)
+                        await application.bot.send_message(
+                            chat_id=TELEGRAM_CHAT_ID,
+                            text=f"Документ: {file_url}",
+                            reply_to_message_id=message.message_id,
+                        )
+                    except Exception:
+                        logger.exception("Failed to post file %s for deal %s", fid, deal_id)
+            except Exception:
+                logger.exception("Failed to fetch files for deal %s", deal_id)
         except Exception:
             logger.exception("Failed to fetch/post deal %s", deal_id)
 
