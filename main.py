@@ -31,6 +31,7 @@ HS_HEADERS = {
 }
 
 HUBSPOT_OWNERS_CACHE_TTL = int(os.getenv("HUBSPOT_OWNERS_CACHE_TTL", "900"))
+COMPANY_NAME_PROP = os.getenv("HUBSPOT_COMPANY_NAME_PROP", "name")
 
 # Cache for HubSpot owners: owner_id -> "First Last" (fallbacks to email/id)
 _OWNERS_MAP_CACHE: Dict[str, str] = {}
@@ -106,11 +107,40 @@ def hs_get_deal(deal_id: str) -> Dict[str, Any]:
             "description_of_deal",
         ],
         "archived": "false",
+        "associations": ["companies"],
     }
     r = requests.get(url, headers=HS_HEADERS, params=params, timeout=15)
     if not r.ok:
         raise HTTPException(status_code=502, detail="HubSpot get deal failed")
     return r.json()
+
+def hs_get_company(company_id: str) -> Dict[str, Any]:
+    url = f"{HS_BASE}/crm/v3/objects/companies/{company_id}"
+    params = {
+        "properties": [COMPANY_NAME_PROP],
+        "archived": "false",
+    }
+    r = requests.get(url, headers=HS_HEADERS, params=params, timeout=15)
+    if not r.ok:
+        raise HTTPException(status_code=502, detail="HubSpot get company failed")
+    return r.json()
+
+def extract_primary_company_id_from_deal(deal: Dict[str, Any]) -> Optional[str]:
+    associations = deal.get("associations") or {}
+    companies = (associations.get("companies") or {}).get("results") or []
+    if not companies:
+        return None
+    # Try to find a result marked as primary via type/label if present
+    for assoc in companies:
+        assoc_type = str(assoc.get("type") or "").lower()
+        if "primary" in assoc_type:
+            cid = str(assoc.get("id") or "").strip()
+            if cid:
+                return cid
+    # Fallback to the first associated company
+    first = companies[0]
+    cid = str(first.get("id") or "").strip()
+    return cid or None
 
 def hs_update_deal(deal_id: str, properties: Dict[str, Any]):
     url = f"{HS_BASE}/crm/v3/objects/deals/{deal_id}"
@@ -221,10 +251,24 @@ async def hubspot_webhook(request: Request):
                 continue
             title = properties.get("dealname", "(no title)")
 
+            # Try to include primary company name
+            company_name = None
+            try:
+                primary_company_id = extract_primary_company_id_from_deal(deal)
+                if primary_company_id:
+                    company = hs_get_company(primary_company_id)
+                    company_name = (company.get("properties") or {}).get(COMPANY_NAME_PROP)
+                    if isinstance(company_name, str) and company_name.strip() == "":
+                        company_name = None
+            except Exception:
+                logger.exception("Failed to fetch primary company for deal %s", deal_id)
+
             lines = [
                 f"📌 New deal: {title}",
                 f"ID: {deal_id}",
             ]
+            if company_name:
+                lines.append(f"company: {company_name}")
 
             # label -> internal property name
             fields_to_render = [
