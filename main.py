@@ -126,10 +126,27 @@ async def hubspot_webhook(request: Request):
             continue
         try:
             deal = hs_get_deal(deal_id)
-            title = deal.get("properties", {}).get("dealname", "(no title)")
+            properties = deal.get("properties", {})
+            title = properties.get("dealname", "(no title)")
+
+            lines = [
+                f"📌 New deal: {title}",
+                f"ID: {deal_id}",
+            ]
+
+            for field_key in ["dealstage", "amount", "hubspot_owner_id", "location"]:
+                value = properties.get(field_key)
+                if value is None:
+                    continue
+                if isinstance(value, str) and value.strip() == "":
+                    continue
+                lines.append(f"{field_key}: {value}")
+
+            text = "\n".join(lines)
+
             await application.bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
-                text=f"📌 New deal: {title}\nID: {deal_id}",
+                text=text,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
