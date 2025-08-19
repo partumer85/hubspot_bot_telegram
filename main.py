@@ -217,7 +217,7 @@ async def schedule_owner_reminder(deal_id: str, owner_id: Any, portal_id: Option
         mention = render_owner_mention(owner_id, owner_name)
         pid = "24115553"
         if pid:
-            deal_link = f"@https://app.hubspot.com/contacts/{pid}/record/0-3/{deal_id}"
+            deal_link = f"https://app.hubspot.com/contacts/{pid}/record/0-3/{deal_id}"
         else:
             deal_link = f"deal id: {deal_id}"
         text = f"{mention} напоминаю, что необходимо определить основной пул по сделке\n{deal_link}"
