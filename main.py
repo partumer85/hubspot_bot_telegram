@@ -39,6 +39,7 @@ COMPANY_NAME_PROP = os.getenv("HUBSPOT_COMPANY_NAME_PROP", "name")
 TELEGRAM_MENTIONS_JSON = os.getenv("TELEGRAM_MENTIONS_JSON", "")
 TELEGRAM_OWNER_MENTIONS_JSON = os.getenv("TELEGRAM_OWNER_MENTIONS_JSON", "")
 HUBSPOT_PORTAL_ID = os.getenv("HUBSPOT_PORTAL_ID", "")
+REMINDER_TEST_MINUTES = int(os.getenv("REMINDER_TEST_MINUTES", "0"))
 
 # Cache for HubSpot owners: owner_id -> "First Last" (fallbacks to email/id)
 _OWNERS_MAP_CACHE: Dict[str, str] = {}
@@ -204,8 +205,13 @@ def add_business_hours_msk(start_dt_utc: datetime, hours: float) -> datetime:
 async def schedule_owner_reminder(deal_id: str, owner_id: Any, portal_id: Optional[str]):
     try:
         now_utc = datetime.now(tz=ZoneInfo("UTC"))
-        trigger_utc = add_business_hours_msk(now_utc, 8.0)
-        delay = max(0, (trigger_utc - now_utc).total_seconds())
+        if REMINDER_TEST_MINUTES > 0:
+            delay = REMINDER_TEST_MINUTES * 60
+            logger.info("Scheduling test reminder in %s seconds for deal %s", delay, deal_id)
+        else:
+            trigger_utc = add_business_hours_msk(now_utc, 8.0)
+            delay = max(0, (trigger_utc - now_utc).total_seconds())
+            logger.info("Scheduling business-hours reminder in %s seconds (trigger %s UTC) for deal %s", delay, trigger_utc.isoformat(), deal_id)
         await asyncio.sleep(delay)
         owner_name = render_owner_name(owner_id)
         mention = render_owner_mention(owner_id, owner_name)
