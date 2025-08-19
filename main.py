@@ -21,6 +21,7 @@ HUBSPOT_TOKEN = os.getenv("HUBSPOT_PRIVATE_TOKEN", "")
 # Allow overriding internal property names if they differ in your HubSpot portal
 DEAL_OWNER_PROP = os.getenv("HUBSPOT_DEAL_OWNER_PROP", "hubspot_owner_id")
 DEAL_LOCATION_PROP = os.getenv("HUBSPOT_DEAL_LOCATION_PROP", "location")
+DISTRIBUTION_FLAG_PROP = os.getenv("HUBSPOT_DISTRIBUTION_FLAG_PROP", "distribution_flag")
 
 HS_BASE = "https://api.hubapi.com"
 HS_HEADERS = {
@@ -37,6 +38,17 @@ def hs_get_deal(deal_id: str) -> Dict[str, Any]:
             "amount",
             DEAL_OWNER_PROP,
             DEAL_LOCATION_PROP,
+            DISTRIBUTION_FLAG_PROP,
+            "source_of_deal",
+            "description",
+            "closedate",
+            "duration",
+            "onsight_remote",
+            "financial_terms",
+            "hs_next_step",
+            "to_notify",
+            "documents_for_deal",
+            "description_of_deal",
         ],
         "archived": "false",
     }
@@ -141,6 +153,12 @@ async def hubspot_webhook(request: Request):
         try:
             deal = hs_get_deal(deal_id)
             properties = deal.get("properties", {})
+
+            # Gate posting by distribution flag (must be 'Yes')
+            flag_value = properties.get(DISTRIBUTION_FLAG_PROP)
+            if not (isinstance(flag_value, str) and flag_value.strip().lower() == "yes"):
+                logger.info("Distribution flag not 'Yes' for deal %s (value=%r); skipping post", deal_id, flag_value)
+                continue
             title = properties.get("dealname", "(no title)")
 
             lines = [
@@ -154,6 +172,16 @@ async def hubspot_webhook(request: Request):
                 ("amount", "amount"),
                 ("hubspot_owner_id", DEAL_OWNER_PROP),
                 ("location", DEAL_LOCATION_PROP),
+                ("source_of_deal", "source_of_deal"),
+                ("description", "description"),
+                ("closedate", "closedate"),
+                ("duration", "duration"),
+                ("onsight_remote", "onsight_remote"),
+                ("financial_terms", "financial_terms"),
+                ("hs_next_step", "hs_next_step"),
+                ("to_notify", "to_notify"),
+                ("documents_for_deal", "documents_for_deal"),
+                ("description_of_deal", "description_of_deal"),
             ]
 
             for label, prop_key in fields_to_render:
