@@ -2,7 +2,10 @@ import os
 import logging
 import time
 import json
+import asyncio
 from typing import Optional, Dict, Any
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import requests
 from fastapi import FastAPI, Request, HTTPException
@@ -34,6 +37,8 @@ HS_HEADERS = {
 HUBSPOT_OWNERS_CACHE_TTL = int(os.getenv("HUBSPOT_OWNERS_CACHE_TTL", "900"))
 COMPANY_NAME_PROP = os.getenv("HUBSPOT_COMPANY_NAME_PROP", "name")
 TELEGRAM_MENTIONS_JSON = os.getenv("TELEGRAM_MENTIONS_JSON", "")
+TELEGRAM_OWNER_MENTIONS_JSON = os.getenv("TELEGRAM_OWNER_MENTIONS_JSON", "")
+HUBSPOT_PORTAL_ID = os.getenv("HUBSPOT_PORTAL_ID", "")
 
 # Cache for HubSpot owners: owner_id -> "First Last" (fallbacks to email/id)
 _OWNERS_MAP_CACHE: Dict[str, str] = {}
@@ -48,6 +53,15 @@ try:
             _MENTIONS_MAP = {str(k).strip().lower(): v for k, v in parsed.items()}
 except Exception:
     logger.exception("Failed to parse TELEGRAM_MENTIONS_JSON; ignoring")
+
+_OWNER_MENTIONS_MAP: Dict[str, Any] = {}
+try:
+    if TELEGRAM_OWNER_MENTIONS_JSON.strip():
+        parsed = json.loads(TELEGRAM_OWNER_MENTIONS_JSON)
+        if isinstance(parsed, dict):
+            _OWNER_MENTIONS_MAP = {str(k).strip(): v for k, v in parsed.items()}
+except Exception:
+    logger.exception("Failed to parse TELEGRAM_OWNER_MENTIONS_JSON; ignoring")
 
 def hs_get_owners_map() -> Dict[str, str]:
     global _OWNERS_MAP_CACHE, _OWNERS_MAP_TS
@@ -136,6 +150,76 @@ def render_mentions_from_surnames(raw_value: Any) -> str:
         else:
             mentions.append(token)
     return ", ".join(mentions)
+
+def render_owner_mention(owner_id: Any, fallback_name: str) -> str:
+    if owner_id is None:
+        return fallback_name or ""
+    key = str(owner_id).strip()
+    mapped = _OWNER_MENTIONS_MAP.get(key)
+    if mapped is None:
+        return fallback_name or key
+    if isinstance(mapped, int) or (isinstance(mapped, str) and mapped.isdigit()):
+        user_id = int(mapped)
+        display = fallback_name or key
+        return f"<a href=\"tg://user?id={user_id}\">{display}</a>"
+    if isinstance(mapped, str) and mapped.startswith('@'):
+        return mapped
+    if isinstance(mapped, str) and mapped:
+        return mapped
+    return fallback_name or key
+
+MSK_TZ = ZoneInfo("Europe/Moscow")
+
+def add_business_hours_msk(start_dt_utc: datetime, hours: float) -> datetime:
+    """Return UTC datetime when given number of business-hours elapse.
+    Business hours: 09:00-19:00 MSK, Mon-Fri.
+    """
+    remaining = timedelta(hours=hours)
+    current_msk = start_dt_utc.astimezone(MSK_TZ)
+    while remaining.total_seconds() > 0:
+        if current_msk.weekday() >= 5:  # Sat/Sun
+            days_ahead = 7 - current_msk.weekday()
+            next_morning = (current_msk + timedelta(days=days_ahead)).replace(hour=9, minute=0, second=0, microsecond=0)
+            current_msk = next_morning
+            continue
+        day_start = current_msk.replace(hour=9, minute=0, second=0, microsecond=0)
+        day_end = current_msk.replace(hour=19, minute=0, second=0, microsecond=0)
+        if current_msk < day_start:
+            current_msk = day_start
+            continue
+        if current_msk >= day_end:
+            next_day = current_msk + timedelta(days=1)
+            current_msk = next_day.replace(hour=9, minute=0, second=0, microsecond=0)
+            continue
+        available = day_end - current_msk
+        if available >= remaining:
+            current_msk = current_msk + remaining
+            remaining = timedelta(0)
+            break
+        else:
+            current_msk = day_end
+            remaining -= available
+    return current_msk.astimezone(ZoneInfo("UTC"))
+
+async def schedule_owner_reminder(deal_id: str, owner_id: Any, portal_id: Optional[str]):
+    try:
+        now_utc = datetime.now(tz=ZoneInfo("UTC"))
+        trigger_utc = add_business_hours_msk(now_utc, 8.0)
+        delay = max(0, (trigger_utc - now_utc).total_seconds())
+        await asyncio.sleep(delay)
+        owner_name = render_owner_name(owner_id)
+        mention = render_owner_mention(owner_id, owner_name)
+        pid = (portal_id or HUBSPOT_PORTAL_ID or "").strip()
+        deal_link = f"https://app.hubspot.com/contacts/{pid}/deal/{deal_id}" if pid else f"deal id: {deal_id}"
+        text = f"{mention} напоминаю, что необходимо определить основной пул по сделке\n{deal_link}"
+        await application.bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        logger.exception("Failed to send owner reminder for deal %s", deal_id)
 
 def hs_get_deal(deal_id: str) -> Dict[str, Any]:
     url = f"{HS_BASE}/crm/v3/objects/deals/{deal_id}"
@@ -383,11 +467,11 @@ async def hubspot_webhook(request: Request):
                 logger.exception("Failed to fetch primary company for deal %s", deal_id)
 
             lines = [
-                f"📌 New deal: {title}",
+                f"📌 Название сделки: {title}",
                 f"ID: {deal_id}",
             ]
             if company_name:
-                lines.append(f"company: {company_name}")
+                lines.append(f"Компания: {company_name}")
 
             # label -> internal property name (russian labels)
             fields_to_render = [
@@ -429,6 +513,15 @@ async def hubspot_webhook(request: Request):
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
+
+            # Schedule reminder for the owner in 8 business hours (MSK)
+            try:
+                owner_id_value = properties.get(DEAL_OWNER_PROP)
+                portal_id = str(deal.get("portalId") or "").strip() or None
+                if owner_id_value:
+                    asyncio.create_task(schedule_owner_reminder(deal_id, owner_id_value, portal_id))
+            except Exception:
+                logger.exception("Failed to schedule owner reminder for deal %s", deal_id)
 
             # If there are any files associated with the deal, forward them afterwards
             try:
