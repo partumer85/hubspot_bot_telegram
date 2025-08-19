@@ -43,13 +43,14 @@ def hs_get_owners_map() -> Dict[str, str]:
     if _OWNERS_MAP_CACHE and (now - _OWNERS_MAP_TS) < HUBSPOT_OWNERS_CACHE_TTL:
         return _OWNERS_MAP_CACHE
 
-    url = f"{HS_BASE}/crm/v3/owners/"
+    url = f"{HS_BASE}/crm/v3/owners"
     params: Dict[str, Any] = {"archived": "false", "limit": 100}
     owners_map: Dict[str, str] = {}
     try:
         while True:
             r = requests.get(url, headers=HS_HEADERS, params=params, timeout=15)
             if not r.ok:
+                logger.warning("Owners API request failed: %s %s", r.status_code, r.text)
                 break
             data = r.json() or {}
             for owner in data.get("results", []) or []:
@@ -107,7 +108,7 @@ def hs_get_deal(deal_id: str) -> Dict[str, Any]:
             "description_of_deal",
         ],
         "archived": "false",
-        "associations": ["companies"],
+        "associations": "companies",
     }
     r = requests.get(url, headers=HS_HEADERS, params=params, timeout=15)
     if not r.ok:
@@ -122,7 +123,12 @@ def hs_get_company(company_id: str) -> Dict[str, Any]:
     }
     r = requests.get(url, headers=HS_HEADERS, params=params, timeout=15)
     if not r.ok:
-        raise HTTPException(status_code=502, detail="HubSpot get company failed")
+        # Try with archived true as a fallback
+        params["archived"] = "true"
+        r = requests.get(url, headers=HS_HEADERS, params=params, timeout=15)
+        if not r.ok:
+            logger.error("Company fetch failed for %s: %s %s", company_id, r.status_code, r.text)
+            raise HTTPException(status_code=502, detail="HubSpot get company failed")
     return r.json()
 
 def extract_primary_company_id_from_deal(deal: Dict[str, Any]) -> Optional[str]:
@@ -130,17 +136,43 @@ def extract_primary_company_id_from_deal(deal: Dict[str, Any]) -> Optional[str]:
     companies = (associations.get("companies") or {}).get("results") or []
     if not companies:
         return None
-    # Try to find a result marked as primary via type/label if present
+    # HubSpot marks primary in associationTypeId or via 'primary' flag in some webhook shapes; be defensive
     for assoc in companies:
+        if assoc.get("primary") is True:
+            cid = str(assoc.get("id") or "").strip()
+            if cid:
+                return cid
         assoc_type = str(assoc.get("type") or "").lower()
         if "primary" in assoc_type:
             cid = str(assoc.get("id") or "").strip()
             if cid:
                 return cid
-    # Fallback to the first associated company
+    # Fallback to first
     first = companies[0]
     cid = str(first.get("id") or "").strip()
     return cid or None
+
+def hs_get_primary_company_id_via_api(deal_id: str) -> Optional[str]:
+    # Use associations API v4 to fetch primary association
+    url = f"{HS_BASE}/crm/v4/objects/deals/{deal_id}/associations/companies"
+    params: Dict[str, Any] = {"limit": 100}
+    r = requests.get(url, headers=HS_HEADERS, params=params, timeout=15)
+    if not r.ok:
+        logger.warning("Associations v4 fetch failed: %s %s", r.status_code, r.text)
+        return None
+    data = r.json() or {}
+    results = data.get("results") or []
+    # v4 returns an array with associationTypeId and toObjectId
+    primary_id = None
+    for item in results:
+        if item.get("associationSpec", {}).get("primary", False):
+            primary_id = str(item.get("toObjectId") or "").strip()
+            if primary_id:
+                return primary_id
+    # Fallback to first
+    if results:
+        primary_id = str(results[0].get("toObjectId") or "").strip()
+    return primary_id or None
 
 def hs_update_deal(deal_id: str, properties: Dict[str, Any]):
     url = f"{HS_BASE}/crm/v3/objects/deals/{deal_id}"
@@ -255,6 +287,8 @@ async def hubspot_webhook(request: Request):
             company_name = None
             try:
                 primary_company_id = extract_primary_company_id_from_deal(deal)
+                if not primary_company_id:
+                    primary_company_id = hs_get_primary_company_id_via_api(deal_id)
                 if primary_company_id:
                     company = hs_get_company(primary_company_id)
                     company_name = (company.get("properties") or {}).get(COMPANY_NAME_PROP)
