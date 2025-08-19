@@ -215,7 +215,7 @@ async def schedule_owner_reminder(deal_id: str, owner_id: Any, portal_id: Option
         await asyncio.sleep(delay)
         owner_name = render_owner_name(owner_id)
         mention = render_owner_mention(owner_id, owner_name)
-        pid = (portal_id or HUBSPOT_PORTAL_ID or "").strip()
+        pid = "24115553"
         if pid:
             deal_link = f"@https://app.hubspot.com/contacts/{pid}/record/0-3/{deal_id}"
         else:
