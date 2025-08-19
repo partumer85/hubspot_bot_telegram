@@ -1,6 +1,7 @@
 import os
 import logging
 import time
+import json
 from typing import Optional, Dict, Any
 
 import requests
@@ -32,10 +33,21 @@ HS_HEADERS = {
 
 HUBSPOT_OWNERS_CACHE_TTL = int(os.getenv("HUBSPOT_OWNERS_CACHE_TTL", "900"))
 COMPANY_NAME_PROP = os.getenv("HUBSPOT_COMPANY_NAME_PROP", "name")
+TELEGRAM_MENTIONS_JSON = os.getenv("TELEGRAM_MENTIONS_JSON", "")
 
 # Cache for HubSpot owners: owner_id -> "First Last" (fallbacks to email/id)
 _OWNERS_MAP_CACHE: Dict[str, str] = {}
 _OWNERS_MAP_TS: float = 0.0
+
+# Mentions mapping cache (surname -> @username or telegram user id)
+_MENTIONS_MAP: Dict[str, Any] = {}
+try:
+    if TELEGRAM_MENTIONS_JSON.strip():
+        parsed = json.loads(TELEGRAM_MENTIONS_JSON)
+        if isinstance(parsed, dict):
+            _MENTIONS_MAP = {str(k).strip().lower(): v for k, v in parsed.items()}
+except Exception:
+    logger.exception("Failed to parse TELEGRAM_MENTIONS_JSON; ignoring")
 
 def hs_get_owners_map() -> Dict[str, str]:
     global _OWNERS_MAP_CACHE, _OWNERS_MAP_TS
@@ -85,6 +97,45 @@ def render_owner_name(raw_owner_id: Any) -> str:
         return ""
     owners_map = hs_get_owners_map()
     return owners_map.get(owner_id_str, owner_id_str)
+
+def render_mentions_from_surnames(raw_value: Any) -> str:
+    if raw_value is None:
+        return ""
+    text = str(raw_value).strip()
+    if not text:
+        return ""
+    # Split by semicolon or comma
+    tokens = [t.strip() for t in text.replace(',', ';').split(';') if t.strip()]
+    mentions: list[str] = []
+    for token in tokens:
+        # Try mapping by: full name, then last word (surname), then first word
+        lc_full = token.lower()
+        words = [w for w in token.split() if w]
+        candidates = [lc_full]
+        if len(words) >= 1:
+            candidates.append(words[-1].lower())  # surname as last word
+        if len(words) >= 2:
+            candidates.append(words[0].lower())   # first name as a fallback
+        mapped = None
+        for cand in candidates:
+            mapped = _MENTIONS_MAP.get(cand)
+            if mapped is not None:
+                break
+        if mapped is None:
+            # No mapping -> keep as plain text token
+            mentions.append(token)
+            continue
+        if isinstance(mapped, int) or (isinstance(mapped, str) and mapped.isdigit()):
+            user_id = int(mapped)
+            mentions.append(f"<a href=\"tg://user?id={user_id}\">{token}</a>")
+        elif isinstance(mapped, str) and mapped.startswith('@'):
+            mentions.append(mapped)
+        elif isinstance(mapped, str) and mapped:
+            # treat non-@ string as display text
+            mentions.append(mapped)
+        else:
+            mentions.append(token)
+    return ", ".join(mentions)
 
 def hs_get_deal(deal_id: str) -> Dict[str, Any]:
     url = f"{HS_BASE}/crm/v3/objects/deals/{deal_id}"
@@ -364,6 +415,8 @@ async def hubspot_webhook(request: Request):
                     continue
                 if prop_key == DEAL_OWNER_PROP:
                     display_value = render_owner_name(value)
+                elif prop_key == "to_notify":
+                    display_value = render_mentions_from_surnames(value)
                 else:
                     display_value = value
                 lines.append(f"{label}: {display_value}")
