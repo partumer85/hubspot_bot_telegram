@@ -154,10 +154,15 @@ async def hubspot_webhook(request: Request):
             deal = hs_get_deal(deal_id)
             properties = deal.get("properties", {})
 
-            # Gate posting by distribution flag (must be 'Yes')
+            # Gate posting by distribution flag (must be true)
             flag_value = properties.get(DISTRIBUTION_FLAG_PROP)
-            if not (isinstance(flag_value, str) and flag_value.strip().lower() == "yes"):
-                logger.info("Distribution flag not 'Yes' for deal %s (value=%r); skipping post", deal_id, flag_value)
+            should_post = False
+            if isinstance(flag_value, bool):
+                should_post = flag_value is True
+            elif isinstance(flag_value, str):
+                should_post = flag_value.strip().lower() == "true"
+            if not should_post:
+                logger.info("Distribution flag is false for deal %s (value=%r); skipping post", deal_id, flag_value)
                 continue
             title = properties.get("dealname", "(no title)")
 
