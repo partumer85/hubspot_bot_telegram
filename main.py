@@ -18,6 +18,10 @@ TELEGRAM_WEBHOOK_URL = os.getenv("TELEGRAM_WEBHOOK_URL", "")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 HUBSPOT_TOKEN = os.getenv("HUBSPOT_PRIVATE_TOKEN", "")
 
+# Allow overriding internal property names if they differ in your HubSpot portal
+DEAL_OWNER_PROP = os.getenv("HUBSPOT_DEAL_OWNER_PROP", "hubspot_owner_id")
+DEAL_LOCATION_PROP = os.getenv("HUBSPOT_DEAL_LOCATION_PROP", "location")
+
 HS_BASE = "https://api.hubapi.com"
 HS_HEADERS = {
     "Authorization": f"Bearer {HUBSPOT_TOKEN}",
@@ -26,7 +30,17 @@ HS_HEADERS = {
 
 def hs_get_deal(deal_id: str) -> Dict[str, Any]:
     url = f"{HS_BASE}/crm/v3/objects/deals/{deal_id}"
-    r = requests.get(url, headers=HS_HEADERS, timeout=15)
+    params = {
+        "properties": [
+            "dealname",
+            "dealstage",
+            "amount",
+            DEAL_OWNER_PROP,
+            DEAL_LOCATION_PROP,
+        ],
+        "archived": "false",
+    }
+    r = requests.get(url, headers=HS_HEADERS, params=params, timeout=15)
     if not r.ok:
         raise HTTPException(status_code=502, detail="HubSpot get deal failed")
     return r.json()
@@ -134,13 +148,21 @@ async def hubspot_webhook(request: Request):
                 f"ID: {deal_id}",
             ]
 
-            for field_key in ["dealstage", "amount", "hubspot_owner_id", "location"]:
-                value = properties.get(field_key)
+            # label -> internal property name
+            fields_to_render = [
+                ("dealstage", "dealstage"),
+                ("amount", "amount"),
+                ("hubspot_owner_id", DEAL_OWNER_PROP),
+                ("location", DEAL_LOCATION_PROP),
+            ]
+
+            for label, prop_key in fields_to_render:
+                value = properties.get(prop_key)
                 if value is None:
                     continue
                 if isinstance(value, str) and value.strip() == "":
                     continue
-                lines.append(f"{field_key}: {value}")
+                lines.append(f"{label}: {value}")
 
             text = "\n".join(lines)
 
