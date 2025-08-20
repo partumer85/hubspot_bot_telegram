@@ -171,6 +171,30 @@ def render_owner_mention(owner_id: Any, fallback_name: str) -> str:
 
 MSK_TZ = ZoneInfo("Europe/Moscow")
 
+def format_date_yyyy_mm_dd(value: Any) -> str:
+    if value is None:
+        return ""
+    s = str(value).strip()
+    if not s:
+        return ""
+    try:
+        # numeric timestamp (ms or s)
+        if s.isdigit():
+            ts = int(s)
+            if ts > 10**12:
+                dt = datetime.utcfromtimestamp(ts / 1000)
+            else:
+                dt = datetime.utcfromtimestamp(ts)
+            return dt.date().isoformat()
+        # ISO-like string
+        if len(s) >= 10 and s[4] == '-' and s[7] == '-':
+            return s[:10]
+        if 'T' in s and len(s.split('T')[0]) == 10:
+            return s.split('T')[0]
+    except Exception:
+        pass
+    return s
+
 def add_business_hours_msk(start_dt_utc: datetime, hours: float) -> datetime:
     """Return UTC datetime when given number of business-hours elapse.
     Business hours: 09:00-19:00 MSK, Mon-Fri.
@@ -518,6 +542,8 @@ async def hubspot_webhook(request: Request):
                     display_value = render_owner_name(value)
                 elif prop_key == "to_notify":
                     display_value = render_mentions_from_surnames(value)
+                elif prop_key == "closedate":
+                    display_value = format_date_yyyy_mm_dd(value)
                 else:
                     display_value = value
                 lines.append(f"{label}: {display_value}")
