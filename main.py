@@ -14,6 +14,8 @@ from pydantic import BaseModel
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
+import gspread
+from google.oauth2 import service_account
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("hubspot_telegram_bot")
@@ -40,6 +42,11 @@ TELEGRAM_MENTIONS_JSON = os.getenv("TELEGRAM_MENTIONS_JSON", "")
 TELEGRAM_OWNER_MENTIONS_JSON = os.getenv("TELEGRAM_OWNER_MENTIONS_JSON", "")
 HUBSPOT_PORTAL_ID = os.getenv("HUBSPOT_PORTAL_ID", "")
 REMINDER_TEST_MINUTES = int(os.getenv("REMINDER_TEST_MINUTES", "0"))
+# Google Sheets settings
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+GOOGLE_SHEETS_SPREADSHEET_ID = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID", "")
+GOOGLE_SHEETS_SHEET_NAME = os.getenv("GOOGLE_SHEETS_SHEET_NAME", "Deals")
 
 # Cache for HubSpot owners: owner_id -> "First Last" (fallbacks to email/id)
 _OWNERS_MAP_CACHE: Dict[str, str] = {}
@@ -63,6 +70,42 @@ try:
             _OWNER_MENTIONS_MAP = {str(k).strip(): v for k, v in parsed.items()}
 except Exception:
     logger.exception("Failed to parse TELEGRAM_OWNER_MENTIONS_JSON; ignoring")
+
+_gs_client = None
+
+def get_gs_client():
+    global _gs_client
+    if _gs_client:
+        return _gs_client
+    try:
+        if GOOGLE_SERVICE_ACCOUNT_JSON.strip():
+            info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+            creds = service_account.Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+            _gs_client = gspread.authorize(creds)
+            return _gs_client
+        if GOOGLE_APPLICATION_CREDENTIALS.strip():
+            creds = service_account.Credentials.from_service_account_file(GOOGLE_APPLICATION_CREDENTIALS, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+            _gs_client = gspread.authorize(creds)
+            return _gs_client
+    except Exception:
+        logger.exception("Failed to init Google Sheets client")
+    return None
+
+def append_deal_row_to_sheet(row: list[Any]):
+    if not GOOGLE_SHEETS_SPREADSHEET_ID:
+        return
+    client = get_gs_client()
+    if not client:
+        return
+    try:
+        sh = client.open_by_key(GOOGLE_SHEETS_SPREADSHEET_ID)
+        try:
+            ws = sh.worksheet(GOOGLE_SHEETS_SHEET_NAME)
+        except Exception:
+            ws = sh.add_worksheet(title=GOOGLE_SHEETS_SHEET_NAME, rows=1000, cols=50)
+        ws.append_row(row, value_input_option="USER_ENTERED")
+    except Exception:
+        logger.exception("Failed to append row to Google Sheet")
 
 def hs_get_owners_map() -> Dict[str, str]:
     global _OWNERS_MAP_CACHE, _OWNERS_MAP_TS
@@ -556,6 +599,44 @@ async def hubspot_webhook(request: Request):
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
+
+            # Append to Google Sheet in the same order as the posted fields
+            try:
+                row_values: list[Any] = []
+                # Название сделки, ID, Компания
+                row_values.append(title)
+                row_values.append(deal_id)
+                row_values.append(company_name or "")
+                # Стадия сделки -> ... -> Комментарии
+                order_props = [
+                    "dealstage",
+                    "amount",
+                    DEAL_OWNER_PROP,
+                    DEAL_LOCATION_PROP,
+                    "source_of_deal",
+                    "description",
+                    "closedate",
+                    "duration",
+                    "onsight_remote",
+                    "financial_terms",
+                    "hs_next_step",
+                    "to_notify",
+                    "description_of_deal",
+                ]
+                for prop_key in order_props:
+                    val = properties.get(prop_key)
+                    if prop_key == DEAL_OWNER_PROP:
+                        val = render_owner_name(val) if val is not None else ""
+                    elif prop_key == "to_notify":
+                        val = render_mentions_from_surnames(val) if val is not None else ""
+                    elif prop_key == "closedate":
+                        val = format_date_yyyy_mm_dd(val) if val is not None else ""
+                    else:
+                        val = "" if (val is None or (isinstance(val, str) and not val.strip())) else val
+                    row_values.append(val)
+                append_deal_row_to_sheet(row_values)
+            except Exception:
+                logger.exception("Failed to append deal to Google Sheet")
 
             # Schedule reminder for the owner in 8 business hours (MSK)
             try:
