@@ -568,6 +568,19 @@ async def hubspot_webhook(request: Request):
             if not should_post:
                 logger.info("Distribution flag is false for deal %s (value=%r); skipping post", deal_id, flag_value)
                 continue
+
+            # Post only if main practice is NOT set at this moment
+            mp_value = properties.get(MAIN_PRACTICE_PROP)
+            mp_is_set = False
+            if mp_value is None:
+                mp_is_set = False
+            elif isinstance(mp_value, str):
+                mp_is_set = bool(mp_value.strip())
+            else:
+                mp_is_set = bool(mp_value)
+            if mp_is_set:
+                logger.info("Main practice is already set for deal %s; skipping initial post", deal_id)
+                continue
             title = properties.get("dealname", "(no title)")
 
             # Try to include primary company name
@@ -605,7 +618,6 @@ async def hubspot_webhook(request: Request):
                 ("Финансовые условия", "financial_terms"),
                 ("Следующие шаги", "hs_next_step"),
                 ("Оповестить", "to_notify"),
-                # documents_for_deal - не показываем в основном сообщении
                 ("Комментарии", "description_of_deal"),
             ]
 
