@@ -93,10 +93,8 @@ _POST_LOCK = asyncio.Lock()
 def build_interest_keyboard(deal_id: str, count: int) -> InlineKeyboardMarkup:
     label = f"Интересуюсь ({count})" if count > 0 else "Интересуюсь (0)"
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(text=label, callback_data=f"interest:{deal_id}"),
-            InlineKeyboardButton(text="Список", callback_data=f"list:{deal_id}")
-        ]
+        [InlineKeyboardButton(text=label, callback_data=f"interest:{deal_id}")],
+        [InlineKeyboardButton(text="Список", callback_data=f"list:{deal_id}")]
     ])
 
 _gs_client = None
