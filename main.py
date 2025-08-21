@@ -183,7 +183,19 @@ async def interest_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Format user list for popup
             user_list = []
             for user_id in sorted(users):
-                user_list.append(f"• ID: {user_id}")
+                try:
+                    # Try to get user info from Telegram
+                    chat_member = await context.bot.get_chat_member(TELEGRAM_CHAT_ID, user_id)
+                    user_name = chat_member.user.first_name or ""
+                    user_last_name = chat_member.user.last_name or ""
+                    full_name = f"{user_name} {user_last_name}".strip()
+                    if full_name:
+                        user_list.append(f"• {full_name}")
+                    else:
+                        user_list.append(f"• ID: {user_id}")
+                except Exception:
+                    # Fallback to user ID if can't get name
+                    user_list.append(f"• ID: {user_id}")
             text = f"Интересуются по сделке {deal_id}:\n" + "\n".join(user_list)
             # Limit popup text length (Telegram has limits)
             if len(text) > 200:
