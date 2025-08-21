@@ -29,6 +29,7 @@ HUBSPOT_TOKEN = os.getenv("HUBSPOT_PRIVATE_TOKEN", "")
 DEAL_OWNER_PROP = os.getenv("HUBSPOT_DEAL_OWNER_PROP", "hubspot_owner_id")
 DEAL_LOCATION_PROP = os.getenv("HUBSPOT_DEAL_LOCATION_PROP", "location")
 DISTRIBUTION_FLAG_PROP = os.getenv("HUBSPOT_DISTRIBUTION_FLAG_PROP", "distribution_flag")
+MAIN_PRACTICE_PROP = os.getenv("HUBSPOT_MAIN_PRACTICE_PROP", "main_practice")
 
 HS_BASE = "https://api.hubapi.com"
 HS_HEADERS = {
@@ -334,6 +335,24 @@ async def schedule_owner_reminder(deal_id: str, owner_id: Any, portal_id: Option
             delay = max(0, (trigger_utc - now_utc).total_seconds())
             logger.info("Scheduling business-hours reminder in %s seconds (trigger %s UTC) for deal %s", delay, trigger_utc.isoformat(), deal_id)
         await asyncio.sleep(delay)
+        # Re-check deal state at reminder time; skip if main practice is already set
+        try:
+            deal_at_reminder = hs_get_deal(deal_id)
+            props_at_reminder = deal_at_reminder.get("properties", {})
+            mp_value = props_at_reminder.get(MAIN_PRACTICE_PROP)
+            is_set = False
+            if mp_value is None:
+                is_set = False
+            elif isinstance(mp_value, str):
+                is_set = bool(mp_value.strip())
+            else:
+                # Non-string values treated as set if truthy
+                is_set = bool(mp_value)
+            if is_set:
+                logger.info("Skipping reminder for deal %s because %s is already set", deal_id, MAIN_PRACTICE_PROP)
+                return
+        except Exception:
+            logger.exception("Failed to re-fetch deal %s at reminder time; proceeding with best effort", deal_id)
         owner_name = render_owner_name(owner_id)
         mention = render_owner_mention(owner_id, owner_name)
         pid = "24115553"
@@ -361,6 +380,7 @@ def hs_get_deal(deal_id: str) -> Dict[str, Any]:
             DEAL_OWNER_PROP,
             DEAL_LOCATION_PROP,
             DISTRIBUTION_FLAG_PROP,
+            MAIN_PRACTICE_PROP,
             "source_of_deal",
             "description",
             "closedate",
@@ -378,48 +398,6 @@ def hs_get_deal(deal_id: str) -> Dict[str, Any]:
     r = requests.get(url, headers=HS_HEADERS, params=params, timeout=15)
     if not r.ok:
         raise HTTPException(status_code=502, detail="HubSpot get deal failed")
-    return r.json()
-
-def hs_get_deal_attachment_ids_v4(deal_id: str) -> list[str]:
-    url = f"{HS_BASE}/crm/v4/objects/deals/{deal_id}/associations/attachments"
-    params: Dict[str, Any] = {"limit": 100}
-    attachment_ids: list[str] = []
-    try:
-        while True:
-            r = requests.get(url, headers=HS_HEADERS, params=params, timeout=15)
-            if not r.ok:
-                logger.warning("Deal->attachments association fetch failed: %s %s", r.status_code, r.text)
-                break
-            data = r.json() or {}
-            for assoc in data.get("results", []) or []:
-                aid = str(assoc.get("toObjectId") or "").strip()
-                if aid:
-                    attachment_ids.append(aid)
-            paging = (data.get("paging") or {}).get("next") or {}
-            after = paging.get("after")
-            if after:
-                params["after"] = after
-            else:
-                break
-    except Exception:
-        logger.exception("Failed to fetch attachment associations for deal %s", deal_id)
-    return attachment_ids
-
-def hs_get_file(file_id: str) -> Dict[str, Any]:
-    # Files API lives under /files/v3
-    url = f"{HS_BASE}/files/v3/files/{file_id}"
-    r = requests.get(url, headers=HS_HEADERS, timeout=15)
-    if not r.ok:
-        logger.warning("File fetch failed for %s: %s %s", file_id, r.status_code, r.text)
-        raise HTTPException(status_code=502, detail="HubSpot get file failed")
-    return r.json()
-
-def hs_get_attachment(attachment_id: str) -> Dict[str, Any]:
-    url = f"{HS_BASE}/crm/v4/objects/attachments/{attachment_id}"
-    r = requests.get(url, headers=HS_HEADERS, timeout=15)
-    if not r.ok:
-        logger.warning("Attachment fetch failed for %s: %s %s", attachment_id, r.status_code, r.text)
-        raise HTTPException(status_code=502, detail="HubSpot get attachment failed")
     return r.json()
 
 def hs_get_company(company_id: str) -> Dict[str, Any]:
@@ -708,46 +686,7 @@ async def hubspot_webhook(request: Request):
             except Exception:
                 logger.exception("Failed to schedule owner reminder for deal %s", deal_id)
 
-            # If there are any files associated with the deal, forward them afterwards
-            try:
-                # Prefer attachments via v4 API
-                attachment_ids = hs_get_deal_attachment_ids_v4(deal_id)
-                if attachment_ids:
-                    for aid in attachment_ids:
-                        try:
-                            att = hs_get_attachment(aid)
-                            # v4 attachments have properties including 'name' and 'url' inside 'properties' or nested 'file' object
-                            props = att.get("properties") or {}
-                            file_url = props.get("publicUrl") or props.get("url") or props.get("urlFull")
-                            if not file_url:
-                                # try files API by mapping ID
-                                pass
-                            if file_url:
-                                await application.bot.send_message(
-                                    chat_id=TELEGRAM_CHAT_ID,
-                                    text=f"Документ: {file_url}",
-                                    reply_to_message_id=message.message_id,
-                                )
-                        except Exception:
-                            logger.exception("Failed to post attachment %s for deal %s", aid, deal_id)
-                else:
-                    # Fallback: legacy files association
-                    file_ids = hs_get_deal_file_association_ids_v3(deal_id)
-                    for fid in file_ids:
-                        try:
-                            file_meta = hs_get_file(fid)
-                            file_url = file_meta.get("url") or file_meta.get("urlFull")
-                            if not file_url:
-                                continue
-                            await application.bot.send_message(
-                                chat_id=TELEGRAM_CHAT_ID,
-                                text=f"Документ: {file_url}",
-                                reply_to_message_id=message.message_id,
-                            )
-                        except Exception:
-                            logger.exception("Failed to post file %s for deal %s", fid, deal_id)
-            except Exception:
-                logger.exception("Failed to fetch files for deal %s", deal_id)
+            # Documents are not required anymore; skipping any file forwarding
         except Exception:
             logger.exception("Failed to fetch/post deal %s", deal_id)
 
