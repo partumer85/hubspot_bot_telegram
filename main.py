@@ -93,7 +93,10 @@ _POST_LOCK = asyncio.Lock()
 def build_interest_keyboard(deal_id: str, count: int) -> InlineKeyboardMarkup:
     label = f"Интересуюсь ({count})" if count > 0 else "Интересуюсь (0)"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(text=label, callback_data=f"interest:{deal_id}")]
+        [
+            InlineKeyboardButton(text=label, callback_data=f"interest:{deal_id}"),
+            InlineKeyboardButton(text="Список", callback_data=f"list:{deal_id}")
+        ]
     ])
 
 _gs_client = None
@@ -153,28 +156,43 @@ async def interest_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         query = update.callback_query
         data = query.data or ""
-        if not data.startswith("interest:"):
+        if data.startswith("interest:"):
+            deal_id = data.split(":", 1)[1]
+            user = query.from_user
+            alias = f"@{user.username}" if user and user.username else str(user.id)
+            ts = datetime.now(MSK_TZ).strftime("%Y-%m-%d %H:%M")
+            # Update in-memory set and compute count
+            users = _INTEREST_USERS.setdefault(deal_id, set())
+            first_time = user.id not in users
+            users.add(user.id)
+            count = len(users)
+            # Update button counter, keep visible
+            try:
+                await query.edit_message_reply_markup(reply_markup=build_interest_keyboard(deal_id, count))
+            except Exception:
+                logger.exception("Failed to update interest keyboard for deal %s", deal_id)
+            # Log only first click to sheet
+            if first_time:
+                append_interest_row_to_sheet([deal_id, ts, alias])
+            # Only toast, no extra message
+            await query.answer(text=("Интерес зафиксирован" if first_time else "Вы уже отмечались"), show_alert=False)
+        elif data.startswith("list:"):
+            deal_id = data.split(":", 1)[1]
+            users = _INTEREST_USERS.get(deal_id, set())
+            if not users:
+                await query.answer(text="Пока никто не отметил интерес", show_alert=True)
+                return
+            # Format user list for popup
+            user_list = []
+            for user_id in sorted(users):
+                user_list.append(f"• ID: {user_id}")
+            text = f"Интересуются по сделке {deal_id}:\n" + "\n".join(user_list)
+            # Limit popup text length (Telegram has limits)
+            if len(text) > 200:
+                text = text[:197] + "..."
+            await query.answer(text=text, show_alert=True)
+        else:
             await query.answer()
-            return
-        deal_id = data.split(":", 1)[1]
-        user = query.from_user
-        alias = f"@{user.username}" if user and user.username else str(user.id)
-        ts = datetime.now(MSK_TZ).strftime("%Y-%m-%d %H:%M")
-        # Update in-memory set and compute count
-        users = _INTEREST_USERS.setdefault(deal_id, set())
-        first_time = user.id not in users
-        users.add(user.id)
-        count = len(users)
-        # Update button counter, keep visible
-        try:
-            await query.edit_message_reply_markup(reply_markup=build_interest_keyboard(deal_id, count))
-        except Exception:
-            logger.exception("Failed to update interest keyboard for deal %s", deal_id)
-        # Log only first click to sheet
-        if first_time:
-            append_interest_row_to_sheet([deal_id, ts, alias])
-        # Only toast, no extra message
-        await query.answer(text=("Интерес зафиксирован" if first_time else "Вы уже отмечались"), show_alert=False)
     except Exception:
         logger.exception("Failed to handle interest callback")
 
