@@ -86,6 +86,10 @@ try:
 except Exception:
     logger.exception("Failed to parse HUBSPOT_DEALSTAGE_MAP_JSON; ignoring")
 
+# In-memory deduplication of initial posts per deal_id
+_POSTED_DEALS: Set[str] = set()
+_POST_LOCK = asyncio.Lock()
+
 def build_interest_keyboard(deal_id: str, count: int) -> InlineKeyboardMarkup:
     label = f"Интересуюсь ({count})" if count > 0 else "Интересуюсь (0)"
     return InlineKeyboardMarkup([
@@ -609,6 +613,13 @@ async def hubspot_webhook(request: Request):
             if mp_is_set:
                 logger.info("Main practice is already set for deal %s; skipping initial post", deal_id)
                 continue
+
+            # Deduplicate: ensure we post only once per deal
+            async with _POST_LOCK:
+                if deal_id in _POSTED_DEALS:
+                    logger.info("Already posted initial message for deal %s; skipping duplicate", deal_id)
+                    continue
+                _POSTED_DEALS.add(deal_id)
             title = properties.get("dealname", "(no title)")
 
             # Try to include primary company name
