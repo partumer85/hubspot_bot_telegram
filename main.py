@@ -3,7 +3,7 @@ import logging
 import time
 import json
 import asyncio
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Set
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -71,6 +71,14 @@ try:
 except Exception:
     logger.exception("Failed to parse TELEGRAM_OWNER_MENTIONS_JSON; ignoring")
 
+_INTEREST_USERS: Dict[str, Set[int]] = {}
+
+def build_interest_keyboard(deal_id: str, count: int) -> InlineKeyboardMarkup:
+    label = f"Интересуюсь ({count})" if count > 0 else "Интересуюсь (0)"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(text=label, callback_data=f"interest:{deal_id}")]
+    ])
+
 _gs_client = None
 
 def get_gs_client():
@@ -127,17 +135,29 @@ def append_interest_row_to_sheet(row: list[Any]):
 async def interest_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         query = update.callback_query
-        await query.answer()
         data = query.data or ""
         if not data.startswith("interest:"):
+            await query.answer()
             return
         deal_id = data.split(":", 1)[1]
         user = query.from_user
         alias = f"@{user.username}" if user and user.username else str(user.id)
         ts = datetime.now(MSK_TZ).strftime("%Y-%m-%d %H:%M")
-        append_interest_row_to_sheet([deal_id, ts, alias])
-        await query.edit_message_reply_markup(reply_markup=None)
-        await query.message.reply_text("Спасибо! Зафиксировал интерес.")
+        # Update in-memory set and compute count
+        users = _INTEREST_USERS.setdefault(deal_id, set())
+        first_time = user.id not in users
+        users.add(user.id)
+        count = len(users)
+        # Update button counter, keep visible
+        try:
+            await query.edit_message_reply_markup(reply_markup=build_interest_keyboard(deal_id, count))
+        except Exception:
+            logger.exception("Failed to update interest keyboard for deal %s", deal_id)
+        # Log only first click to sheet
+        if first_time:
+            append_interest_row_to_sheet([deal_id, ts, alias])
+        # Only toast, no extra message
+        await query.answer(text=("Интерес зафиксирован" if first_time else "Вы уже отмечались"), show_alert=False)
     except Exception:
         logger.exception("Failed to handle interest callback")
 
@@ -629,9 +649,7 @@ async def hubspot_webhook(request: Request):
 
             text = "\n".join(lines)
 
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton(text="Интересуюсь", callback_data=f"interest:{deal_id}")]
-            ])
+            keyboard = build_interest_keyboard(deal_id, len(_INTEREST_USERS.get(deal_id, set())))
 
             message = await application.bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
