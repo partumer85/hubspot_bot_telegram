@@ -11,9 +11,9 @@ import requests
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 import gspread
 from google.oauth2 import service_account
 
@@ -106,6 +106,40 @@ def append_deal_row_to_sheet(row: list[Any]):
         ws.append_row(row, value_input_option="USER_ENTERED")
     except Exception:
         logger.exception("Failed to append row to Google Sheet")
+
+def append_interest_row_to_sheet(row: list[Any]):
+    if not GOOGLE_SHEETS_SPREADSHEET_ID:
+        return
+    client = get_gs_client()
+    if not client:
+        return
+    try:
+        sh = client.open_by_key(GOOGLE_SHEETS_SPREADSHEET_ID)
+        sheet_name = os.getenv("GOOGLE_SHEETS_INTEREST_SHEET_NAME", "Interest")
+        try:
+            ws = sh.worksheet(sheet_name)
+        except Exception:
+            ws = sh.add_worksheet(title=sheet_name, rows=1000, cols=10)
+        ws.append_row(row, value_input_option="USER_ENTERED")
+    except Exception:
+        logger.exception("Failed to append interest row to Google Sheet")
+
+async def interest_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        query = update.callback_query
+        await query.answer()
+        data = query.data or ""
+        if not data.startswith("interest:"):
+            return
+        deal_id = data.split(":", 1)[1]
+        user = query.from_user
+        alias = f"@{user.username}" if user and user.username else str(user.id)
+        ts = datetime.now(MSK_TZ).strftime("%Y-%m-%d %H:%M")
+        append_interest_row_to_sheet([deal_id, ts, alias])
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("Спасибо! Зафиксировал интерес.")
+    except Exception:
+        logger.exception("Failed to handle interest callback")
 
 def hs_get_owners_map() -> Dict[str, str]:
     global _OWNERS_MAP_CACHE, _OWNERS_MAP_TS
@@ -468,6 +502,8 @@ async def posttest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 application.add_handler(CommandHandler("posttest", posttest_cmd))
 
+application.add_handler(CallbackQueryHandler(interest_callback))
+
 class HubSpotEvent(BaseModel):
     objectId: str
     objectType: Optional[str] = None
@@ -593,11 +629,16 @@ async def hubspot_webhook(request: Request):
 
             text = "\n".join(lines)
 
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton(text="Интересуюсь", callback_data=f"interest:{deal_id}")]
+            ])
+
             message = await application.bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
                 text=text,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
+                reply_markup=keyboard,
             )
 
             # Append to Google Sheet in the same order as the posted fields
@@ -634,6 +675,8 @@ async def hubspot_webhook(request: Request):
                     else:
                         val = "" if (val is None or (isinstance(val, str) and not val.strip())) else val
                     row_values.append(val)
+                post_dt = datetime.now(MSK_TZ).strftime("%Y-%m-%d %H:%M")
+                row_values.append(post_dt)
                 append_deal_row_to_sheet(row_values)
             except Exception:
                 logger.exception("Failed to append deal to Google Sheet")
