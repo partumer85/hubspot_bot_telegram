@@ -43,6 +43,8 @@ TELEGRAM_MENTIONS_JSON = os.getenv("TELEGRAM_MENTIONS_JSON", "")
 TELEGRAM_OWNER_MENTIONS_JSON = os.getenv("TELEGRAM_OWNER_MENTIONS_JSON", "")
 HUBSPOT_PORTAL_ID = os.getenv("HUBSPOT_PORTAL_ID", "")
 REMINDER_TEST_MINUTES = int(os.getenv("REMINDER_TEST_MINUTES", "0"))
+# Optional: mapping from internal dealstage values -> pretty labels
+DEALSTAGE_MAP_JSON = os.getenv("HUBSPOT_DEALSTAGE_MAP_JSON", "")
 # Google Sheets settings
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
@@ -73,6 +75,16 @@ except Exception:
     logger.exception("Failed to parse TELEGRAM_OWNER_MENTIONS_JSON; ignoring")
 
 _INTEREST_USERS: Dict[str, Set[int]] = {}
+
+# Dealstage mapping cache (internal value -> pretty label)
+_DEALSTAGE_MAP: Dict[str, str] = {}
+try:
+    if DEALSTAGE_MAP_JSON.strip():
+        parsed = json.loads(DEALSTAGE_MAP_JSON)
+        if isinstance(parsed, dict):
+            _DEALSTAGE_MAP = {str(k).strip(): str(v) for k, v in parsed.items()}
+except Exception:
+    logger.exception("Failed to parse HUBSPOT_DEALSTAGE_MAP_JSON; ignoring")
 
 def build_interest_keyboard(deal_id: str, count: int) -> InlineKeyboardMarkup:
     label = f"Интересуюсь ({count})" if count > 0 else "Интересуюсь (0)"
@@ -266,6 +278,22 @@ def render_owner_mention(owner_id: Any, fallback_name: str) -> str:
     if isinstance(mapped, str) and mapped:
         return mapped
     return fallback_name or key
+
+def render_dealstage(raw_value: Any) -> str:
+    if raw_value is None:
+        return ""
+    key = str(raw_value).strip()
+    if not key:
+        return ""
+    # exact match first
+    val = _DEALSTAGE_MAP.get(key)
+    if val is not None:
+        return val
+    # try lowercase key as a fallback
+    val = _DEALSTAGE_MAP.get(key.lower())
+    if val is not None:
+        return val
+    return key
 
 MSK_TZ = ZoneInfo("Europe/Moscow")
 
@@ -633,6 +661,8 @@ async def hubspot_webhook(request: Request):
                     display_value = render_mentions_from_surnames(value)
                 elif prop_key == "closedate":
                     display_value = format_date_yyyy_mm_dd(value)
+                elif prop_key == "dealstage":
+                    display_value = render_dealstage(value)
                 else:
                     display_value = value
                 lines.append(f"{label}: {display_value}")
@@ -680,6 +710,8 @@ async def hubspot_webhook(request: Request):
                         val = render_mentions_from_surnames(val) if val is not None else ""
                     elif prop_key == "closedate":
                         val = format_date_yyyy_mm_dd(val) if val is not None else ""
+                    elif prop_key == "dealstage":
+                        val = render_dealstage(val) if val is not None else ""
                     else:
                         val = "" if (val is None or (isinstance(val, str) and not val.strip())) else val
                     row_values.append(val)
