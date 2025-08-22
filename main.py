@@ -90,6 +90,9 @@ except Exception:
 _POSTED_DEALS: Set[str] = set()
 _POST_LOCK = asyncio.Lock()
 
+# Cache deal names for popup display
+_DEAL_NAMES: Dict[str, str] = {}
+
 def build_interest_keyboard(deal_id: str, count: int) -> InlineKeyboardMarkup:
     label = f"Интересуюсь ({count})" if count > 0 else "Интересуюсь (0)"
     return InlineKeyboardMarkup([
@@ -196,7 +199,9 @@ async def interest_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     # Fallback to user ID if can't get name
                     user_list.append(f"• ID: {user_id}")
-            text = f"Интересуются по сделке {deal_id}:\n" + "\n".join(user_list)
+            # Get deal name from cache or use ID as fallback
+            deal_name = _DEAL_NAMES.get(deal_id, deal_id)
+            text = f"Интересуются по сделке {deal_name}:\n" + "\n".join(user_list)
             # Limit popup text length (Telegram has limits)
             if len(text) > 200:
                 text = text[:197] + "..."
@@ -449,6 +454,7 @@ def hs_get_deal(deal_id: str) -> Dict[str, Any]:
             "financial_terms",
             "hs_next_step",
             "to_notify",
+            "rfp___docs",
             "documents_for_deal",
             "description_of_deal",
         ],
@@ -629,7 +635,7 @@ async def hubspot_webhook(request: Request):
                 logger.info("Distribution flag is false for deal %s (value=%r); skipping post", deal_id, flag_value)
                 continue
 
-            # Post only if main practice is NOT set at this moment
+            # Check main practice status
             mp_value = properties.get(MAIN_PRACTICE_PROP)
             mp_is_set = False
             if mp_value is None:
@@ -638,9 +644,24 @@ async def hubspot_webhook(request: Request):
                 mp_is_set = bool(mp_value.strip())
             else:
                 mp_is_set = bool(mp_value)
+            
+            # If main practice is set, post notification about it
             if mp_is_set:
-                logger.info("Main practice is already set for deal %s; skipping initial post", deal_id)
+                title = properties.get("dealname", "(no title)")
+                deal_link = f"https://app.hubspot.com/contacts/24115553/record/0-3/{deal_id}"
+                text = f"Для сделки {title} определен основной пул: {mp_value}\n{deal_link}"
+                
+                await application.bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+                logger.info("Posted main practice notification for deal %s", deal_id)
                 continue
+            
+            # Post only if main practice is NOT set at this moment (original logic)
+            logger.info("Main practice is not set for deal %s; proceeding with initial post", deal_id)
 
             # Deduplicate: ensure we post only once per deal
             async with _POST_LOCK:
@@ -649,6 +670,8 @@ async def hubspot_webhook(request: Request):
                     continue
                 _POSTED_DEALS.add(deal_id)
             title = properties.get("dealname", "(no title)")
+            # Cache deal name for popup display
+            _DEAL_NAMES[deal_id] = title
 
             # Try to include primary company name
             company_name = None
@@ -685,6 +708,7 @@ async def hubspot_webhook(request: Request):
                 ("Финансовые условия", "financial_terms"),
                 ("Следующие шаги", "hs_next_step"),
                 ("Оповестить", "to_notify"),
+                ("Ссылка на документы", "rfp___docs"),
                 ("Комментарии", "description_of_deal"),
             ]
 
@@ -739,6 +763,7 @@ async def hubspot_webhook(request: Request):
                     "financial_terms",
                     "hs_next_step",
                     "to_notify",
+                    "rfp___docs",
                     "description_of_deal",
                 ]
                 for prop_key in order_props:
