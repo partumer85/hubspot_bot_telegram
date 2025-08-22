@@ -696,7 +696,7 @@ async def hubspot_webhook(request: Request):
 
             lines = [
                 f"📌 Название сделки: {title}",
-                f"ID: {deal_id}",
+                f"ID: <a href=\"https://app.hubspot.com/contacts/24115553/record/0-3/{deal_id}\">{deal_id}</a>",
             ]
             if company_name:
                 lines.append(f"Компания: {company_name}")
