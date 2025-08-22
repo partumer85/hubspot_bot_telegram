@@ -93,6 +93,9 @@ _POST_LOCK = asyncio.Lock()
 # Cache deal names for popup display
 _DEAL_NAMES: Dict[str, str] = {}
 
+# Cache original message IDs for replies
+_DEAL_MESSAGES: Dict[str, int] = {}
+
 def build_interest_keyboard(deal_id: str, count: int) -> InlineKeyboardMarkup:
     label = f"Интересуюсь ({count})" if count > 0 else "Интересуюсь (0)"
     return InlineKeyboardMarkup([
@@ -651,11 +654,15 @@ async def hubspot_webhook(request: Request):
                 deal_link = f"https://app.hubspot.com/contacts/24115553/record/0-3/{deal_id}"
                 text = f"Для сделки {title} определен основной пул: {mp_value}\n{deal_link}"
                 
+                # Get original message ID for reply
+                original_message_id = _DEAL_MESSAGES.get(deal_id)
+                
                 await application.bot.send_message(
                     chat_id=TELEGRAM_CHAT_ID,
                     text=text,
                     parse_mode=ParseMode.HTML,
                     disable_web_page_preview=True,
+                    reply_to_message_id=original_message_id,
                 )
                 logger.info("Posted main practice notification for deal %s", deal_id)
                 continue
@@ -741,6 +748,8 @@ async def hubspot_webhook(request: Request):
                 disable_web_page_preview=True,
                 reply_markup=keyboard,
             )
+            # Cache message ID for future replies
+            _DEAL_MESSAGES[deal_id] = message.message_id
 
             # Append to Google Sheet in the same order as the posted fields
             try:
