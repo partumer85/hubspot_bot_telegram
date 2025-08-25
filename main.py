@@ -394,47 +394,52 @@ def add_business_hours_msk(start_dt_utc: datetime, hours: float) -> datetime:
 
 async def schedule_owner_reminder(deal_id: str, owner_id: Any, portal_id: Optional[str]):
     try:
-        now_utc = datetime.now(tz=ZoneInfo("UTC"))
-        if REMINDER_TEST_MINUTES > 0:
-            delay = REMINDER_TEST_MINUTES * 60
-            logger.info("Scheduling test reminder in %s seconds for deal %s", delay, deal_id)
-        else:
-            trigger_utc = add_business_hours_msk(now_utc, 8.0)
-            delay = max(0, (trigger_utc - now_utc).total_seconds())
-            logger.info("Scheduling business-hours reminder in %s seconds (trigger %s UTC) for deal %s", delay, trigger_utc.isoformat(), deal_id)
-        await asyncio.sleep(delay)
-        # Re-check deal state at reminder time; skip if main practice is already set
-        try:
-            deal_at_reminder = hs_get_deal(deal_id)
-            props_at_reminder = deal_at_reminder.get("properties", {})
-            mp_value = props_at_reminder.get(MAIN_PRACTICE_PROP)
-            is_set = False
-            if mp_value is None:
-                is_set = False
-            elif isinstance(mp_value, str):
-                is_set = bool(mp_value.strip())
+        while True:  # Keep reminding until main practice is set
+            now_utc = datetime.now(tz=ZoneInfo("UTC"))
+            if REMINDER_TEST_MINUTES > 0:
+                delay = REMINDER_TEST_MINUTES * 60
+                logger.info("Scheduling test reminder in %s seconds for deal %s", delay, deal_id)
             else:
-                # Non-string values treated as set if truthy
-                is_set = bool(mp_value)
-            if is_set:
-                logger.info("Skipping reminder for deal %s because %s is already set", deal_id, MAIN_PRACTICE_PROP)
-                return
-        except Exception:
-            logger.exception("Failed to re-fetch deal %s at reminder time; proceeding with best effort", deal_id)
-        owner_name = render_owner_name(owner_id)
-        mention = render_owner_mention(owner_id, owner_name)
-        pid = "24115553"
-        if pid:
-            deal_link = f"https://app.hubspot.com/contacts/{pid}/record/0-3/{deal_id}"
-        else:
-            deal_link = f"deal id: {deal_id}"
-        text = f"{mention} напоминаю, что необходимо определить основной пул по сделке\n{deal_link}"
-        await application.bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=text,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+                trigger_utc = add_business_hours_msk(now_utc, 8.0)
+                delay = max(0, (trigger_utc - now_utc).total_seconds())
+                logger.info("Scheduling business-hours reminder in %s seconds (trigger %s UTC) for deal %s", delay, trigger_utc.isoformat(), deal_id)
+            await asyncio.sleep(delay)
+            
+            # Re-check deal state at reminder time; stop if main practice is already set
+            try:
+                deal_at_reminder = hs_get_deal(deal_id)
+                props_at_reminder = deal_at_reminder.get("properties", {})
+                mp_value = props_at_reminder.get(MAIN_PRACTICE_PROP)
+                is_set = False
+                if mp_value is None:
+                    is_set = False
+                elif isinstance(mp_value, str):
+                    is_set = bool(mp_value.strip())
+                else:
+                    # Non-string values treated as set if truthy
+                    is_set = bool(mp_value)
+                if is_set:
+                    logger.info("Stopping reminders for deal %s because %s is now set", deal_id, MAIN_PRACTICE_PROP)
+                    return
+            except Exception:
+                logger.exception("Failed to re-fetch deal %s at reminder time; proceeding with best effort", deal_id)
+            
+            # Send reminder
+            owner_name = render_owner_name(owner_id)
+            mention = render_owner_mention(owner_id, owner_name)
+            pid = "24115553"
+            if pid:
+                deal_link = f"https://app.hubspot.com/contacts/{pid}/record/0-3/{deal_id}"
+            else:
+                deal_link = f"deal id: {deal_id}"
+            text = f"{mention} напоминаю, что необходимо определить основной пул по сделке\n{deal_link}"
+            await application.bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            logger.info("Sent reminder for deal %s, will check again in 8 business hours", deal_id)
     except Exception:
         logger.exception("Failed to send owner reminder for deal %s", deal_id)
 
