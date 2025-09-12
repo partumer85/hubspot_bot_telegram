@@ -490,13 +490,18 @@ async def schedule_owner_reminder(deal_id: str, owner_id: Any, portal_id: Option
             else:
                 deal_link = f"deal id: {deal_id}"
             text = f"{mention} напоминаю, что необходимо определить основной пул по сделке\n{deal_link}"
-            await application.bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=text,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
-            logger.info("Sent reminder for deal %s, will check again in 8 business hours", deal_id)
+            
+            try:
+                await application.bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+                logger.info("Sent reminder for deal %s, will check again in 8 business hours", deal_id)
+            except Exception as send_error:
+                logger.error("Failed to send reminder for deal %s to chat %s: %s", deal_id, TELEGRAM_CHAT_ID, send_error)
+                # Don't re-raise, just log and continue
     except asyncio.CancelledError:
         logger.info("Reminder task for deal %s was cancelled", deal_id)
         raise
@@ -628,12 +633,16 @@ application.add_handler(CommandHandler("assign", assign_cmd))
 app = FastAPI()
 async def posttest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
+        # Log current chat ID for debugging
+        logger.info("Attempting to send message to TELEGRAM_CHAT_ID: %s", TELEGRAM_CHAT_ID)
+        
         await application.bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
             text="🔧 Test post to TELEGRAM_CHAT_ID"
         )
-        await update.message.reply_text("✅ Sent to channel")
+        await update.message.reply_text(f"✅ Sent to channel (ID: {TELEGRAM_CHAT_ID})")
     except Exception as e:
+        logger.exception("Failed to send test message to TELEGRAM_CHAT_ID: %s", TELEGRAM_CHAT_ID)
         await update.message.reply_text(f"❌ Failed: {e}")
 
 application.add_handler(CommandHandler("posttest", posttest_cmd))
@@ -655,6 +664,27 @@ async def test_chosen_practice_cmd(update: Update, context: ContextTypes.DEFAULT
 
 application.add_handler(CommandHandler("testchosen", test_chosen_practice_cmd))
 
+async def getchatid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Get current chat ID for debugging"""
+    try:
+        chat_id = update.effective_chat.id
+        chat_type = update.effective_chat.type
+        chat_title = getattr(update.effective_chat, 'title', 'N/A')
+        
+        message = f"""📋 Chat Information:
+ID: `{chat_id}`
+Type: {chat_type}
+Title: {chat_title}
+
+Current TELEGRAM_CHAT_ID: `{TELEGRAM_CHAT_ID}`
+Match: {'✅' if chat_id == TELEGRAM_CHAT_ID else '❌'}"""
+        
+        await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed: {e}")
+
+application.add_handler(CommandHandler("getchatid", getchatid_cmd))
+
 application.add_handler(CallbackQueryHandler(interest_callback))
 
 class HubSpotEvent(BaseModel):
@@ -663,6 +693,12 @@ class HubSpotEvent(BaseModel):
 
 @app.on_event("startup")
 async def on_startup():
+    # Validate TELEGRAM_CHAT_ID
+    if TELEGRAM_CHAT_ID == 0:
+        logger.error("TELEGRAM_CHAT_ID is not set or is 0. Bot may not work properly.")
+    else:
+        logger.info("TELEGRAM_CHAT_ID is set to: %s", TELEGRAM_CHAT_ID)
+    
     await application.bot.set_webhook(url=f"{TELEGRAM_WEBHOOK_URL}")
     await application.initialize()
     await application.start()
