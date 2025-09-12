@@ -96,6 +96,18 @@ _DEAL_NAMES: Dict[str, str] = {}
 # Cache original message IDs for replies
 _DEAL_MESSAGES: Dict[str, int] = {}
 
+# Track active reminder tasks to allow cancellation
+_ACTIVE_REMINDERS: Dict[str, asyncio.Task] = {}
+
+def cancel_deal_reminders(deal_id: str):
+    """Cancel any active reminder tasks for the given deal_id"""
+    if deal_id in _ACTIVE_REMINDERS:
+        task = _ACTIVE_REMINDERS[deal_id]
+        if not task.done():
+            task.cancel()
+            logger.info("Cancelled active reminder task for deal %s", deal_id)
+        del _ACTIVE_REMINDERS[deal_id]
+
 def build_interest_keyboard(deal_id: str, count: int) -> InlineKeyboardMarkup:
     label = f"Интересуюсь ({count})" if count > 0 else "Интересуюсь (0)"
     return InlineKeyboardMarkup([
@@ -155,6 +167,32 @@ def append_interest_row_to_sheet(row: list[Any]):
         ws.append_row(row, value_input_option="USER_ENTERED")
     except Exception:
         logger.exception("Failed to append interest row to Google Sheet")
+
+def append_chosen_practice_row_to_sheet(deal_id: str, main_practice: str):
+    """Append a row to Chosen_practice sheet with deal_id, main_practice, and timestamp"""
+    if not GOOGLE_SHEETS_SPREADSHEET_ID:
+        return
+    client = get_gs_client()
+    if not client:
+        return
+    try:
+        sh = client.open_by_key(GOOGLE_SHEETS_SPREADSHEET_ID)
+        sheet_name = "Chosen_practice"
+        try:
+            ws = sh.worksheet(sheet_name)
+        except Exception:
+            # Create new worksheet with headers
+            ws = sh.add_worksheet(title=sheet_name, rows=1000, cols=10)
+            # Add headers
+            ws.append_row(["deal_id", "main_practice", "timestamp"], value_input_option="USER_ENTERED")
+        
+        # Prepare row data
+        timestamp = datetime.now(MSK_TZ).strftime("%Y-%m-%d %H:%M")
+        row = [deal_id, main_practice, timestamp]
+        ws.append_row(row, value_input_option="USER_ENTERED")
+        logger.info("Logged chosen practice for deal %s: %s", deal_id, main_practice)
+    except Exception:
+        logger.exception("Failed to append chosen practice row to Google Sheet")
 
 async def interest_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -394,7 +432,12 @@ def add_business_hours_msk(start_dt_utc: datetime, hours: float) -> datetime:
 
 async def schedule_owner_reminder(deal_id: str, owner_id: Any, portal_id: Optional[str]):
     try:
-        while True:  # Keep reminding until main practice is set
+        # Register this task for potential cancellation
+        current_task = asyncio.current_task()
+        if current_task:
+            _ACTIVE_REMINDERS[deal_id] = current_task
+        
+        while True:  # Keep reminding until main practice is set or distribution flag is false
             now_utc = datetime.now(tz=ZoneInfo("UTC"))
             if REMINDER_TEST_MINUTES > 0:
                 delay = REMINDER_TEST_MINUTES * 60
@@ -405,10 +448,24 @@ async def schedule_owner_reminder(deal_id: str, owner_id: Any, portal_id: Option
                 logger.info("Scheduling business-hours reminder in %s seconds (trigger %s UTC) for deal %s", delay, trigger_utc.isoformat(), deal_id)
             await asyncio.sleep(delay)
             
-            # Re-check deal state at reminder time; stop if main practice is already set
+            # Re-check deal state at reminder time; stop if main practice is set OR distribution flag is false
             try:
                 deal_at_reminder = hs_get_deal(deal_id)
                 props_at_reminder = deal_at_reminder.get("properties", {})
+                
+                # Check distribution flag first
+                flag_value = props_at_reminder.get(DISTRIBUTION_FLAG_PROP)
+                should_continue = False
+                if isinstance(flag_value, bool):
+                    should_continue = flag_value is True
+                elif isinstance(flag_value, str):
+                    should_continue = flag_value.strip().lower() == "true"
+                
+                if not should_continue:
+                    logger.info("Stopping reminders for deal %s because distribution flag is now false", deal_id)
+                    return
+                
+                # Check main practice status
                 mp_value = props_at_reminder.get(MAIN_PRACTICE_PROP)
                 is_set = False
                 if mp_value is None:
@@ -440,8 +497,15 @@ async def schedule_owner_reminder(deal_id: str, owner_id: Any, portal_id: Option
                 disable_web_page_preview=True,
             )
             logger.info("Sent reminder for deal %s, will check again in 8 business hours", deal_id)
+    except asyncio.CancelledError:
+        logger.info("Reminder task for deal %s was cancelled", deal_id)
+        raise
     except Exception:
         logger.exception("Failed to send owner reminder for deal %s", deal_id)
+    finally:
+        # Clean up task registration
+        if deal_id in _ACTIVE_REMINDERS:
+            del _ACTIVE_REMINDERS[deal_id]
 
 def hs_get_deal(deal_id: str) -> Dict[str, Any]:
     url = f"{HS_BASE}/crm/v3/objects/deals/{deal_id}"
@@ -574,6 +638,23 @@ async def posttest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 application.add_handler(CommandHandler("posttest", posttest_cmd))
 
+async def test_chosen_practice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Test command to manually log a chosen practice entry"""
+    try:
+        if not context.args or len(context.args) < 2:
+            await update.message.reply_text("Usage: /testchosen <deal_id> <main_practice>")
+            return
+        
+        deal_id = context.args[0]
+        main_practice = " ".join(context.args[1:])
+        
+        append_chosen_practice_row_to_sheet(deal_id, main_practice)
+        await update.message.reply_text(f"✅ Logged chosen practice for deal {deal_id}: {main_practice}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed: {e}")
+
+application.add_handler(CommandHandler("testchosen", test_chosen_practice_cmd))
+
 application.add_handler(CallbackQueryHandler(interest_callback))
 
 class HubSpotEvent(BaseModel):
@@ -640,7 +721,9 @@ async def hubspot_webhook(request: Request):
             elif isinstance(flag_value, str):
                 should_post = flag_value.strip().lower() == "true"
             if not should_post:
-                logger.info("Distribution flag is false for deal %s (value=%r); skipping post", deal_id, flag_value)
+                logger.info("Distribution flag is false for deal %s (value=%r); skipping post and cancelling any active reminders", deal_id, flag_value)
+                # Cancel any active reminder tasks for this deal
+                cancel_deal_reminders(deal_id)
                 continue
 
             # Check main practice status
@@ -658,6 +741,15 @@ async def hubspot_webhook(request: Request):
                 title = properties.get("dealname", "(no title)")
                 deal_link = f"https://app.hubspot.com/contacts/24115553/record/0-3/{deal_id}"
                 text = f"Для сделки {title} определен основной пул: {mp_value}\n{deal_link}"
+                
+                # Cancel any active reminder tasks for this deal
+                cancel_deal_reminders(deal_id)
+                
+                # Log to Chosen_practice sheet
+                try:
+                    append_chosen_practice_row_to_sheet(deal_id, str(mp_value))
+                except Exception:
+                    logger.exception("Failed to log chosen practice to Google Sheet for deal %s", deal_id)
                 
                 # Get original message ID for reply
                 original_message_id = _DEAL_MESSAGES.get(deal_id)
