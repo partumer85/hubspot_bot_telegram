@@ -109,10 +109,10 @@ def cancel_deal_reminders(deal_id: str):
         del _ACTIVE_REMINDERS[deal_id]
 
 def build_interest_keyboard(deal_id: str, count: int) -> InlineKeyboardMarkup:
-    label = f"Интересуюсь ({count})" if count > 0 else "Интересуюсь (0)"
+    label = f"Interested ({count})" if count > 0 else "Interested (0)"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(text=label, callback_data=f"interest:{deal_id}")],
-        [InlineKeyboardButton(text="Список", callback_data=f"list:{deal_id}")]
+        [InlineKeyboardButton(text="List", callback_data=f"list:{deal_id}")]
     ])
 
 _gs_client = None
@@ -194,6 +194,181 @@ def append_chosen_practice_row_to_sheet(deal_id: str, main_practice: str):
     except Exception:
         logger.exception("Failed to append chosen practice row to Google Sheet")
 
+def get_deal_ids_from_sheet() -> Set[str]:
+    """Read all deal_id values from Deals sheet (column 'Deal ID')"""
+    if not GOOGLE_SHEETS_SPREADSHEET_ID:
+        return set()
+    client = get_gs_client()
+    if not client:
+        return set()
+    deal_ids: Set[str] = set()
+    try:
+        sh = client.open_by_key(GOOGLE_SHEETS_SPREADSHEET_ID)
+        try:
+            ws = sh.worksheet(GOOGLE_SHEETS_SHEET_NAME)
+        except Exception:
+            logger.warning("Deals sheet '%s' not found, skipping reminder restoration", GOOGLE_SHEETS_SHEET_NAME)
+            return set()
+        
+        # Get all values
+        all_values = ws.get_all_values()
+        if not all_values:
+            return set()
+        
+        # Find column index for "Deal ID"
+        header_row = all_values[0]
+        try:
+            deal_id_col_idx = header_row.index("Deal ID")
+        except ValueError:
+            logger.warning("Column 'Deal ID' not found in Deals sheet, skipping reminder restoration")
+            return set()
+        
+        # Extract deal_id from each row (skip header)
+        for row in all_values[1:]:
+            if len(row) > deal_id_col_idx:
+                deal_id = str(row[deal_id_col_idx]).strip()
+                if deal_id:
+                    deal_ids.add(deal_id)
+        
+        logger.info("Read %d deal IDs from Deals sheet", len(deal_ids))
+    except Exception:
+        logger.exception("Failed to read deal IDs from Deals sheet")
+    return deal_ids
+
+def get_chosen_practice_deal_ids_from_sheet() -> Set[str]:
+    """Read all deal_id values from Chosen_practice sheet (column 'deal_id')"""
+    if not GOOGLE_SHEETS_SPREADSHEET_ID:
+        return set()
+    client = get_gs_client()
+    if not client:
+        return set()
+    deal_ids: Set[str] = set()
+    try:
+        sh = client.open_by_key(GOOGLE_SHEETS_SPREADSHEET_ID)
+        sheet_name = "Chosen_practice"
+        try:
+            ws = sh.worksheet(sheet_name)
+        except Exception:
+            # Sheet doesn't exist yet, which is fine - no deals have chosen practice
+            logger.info("Chosen_practice sheet not found, assuming no deals have chosen practice")
+            return set()
+        
+        # Get all values
+        all_values = ws.get_all_values()
+        if not all_values:
+            return set()
+        
+        # Find column index for "deal_id"
+        header_row = all_values[0]
+        try:
+            deal_id_col_idx = header_row.index("deal_id")
+        except ValueError:
+            logger.warning("Column 'deal_id' not found in Chosen_practice sheet")
+            return set()
+        
+        # Extract deal_id from each row (skip header)
+        for row in all_values[1:]:
+            if len(row) > deal_id_col_idx:
+                deal_id = str(row[deal_id_col_idx]).strip()
+                if deal_id:
+                    deal_ids.add(deal_id)
+        
+        logger.info("Read %d deal IDs from Chosen_practice sheet", len(deal_ids))
+    except Exception:
+        logger.exception("Failed to read deal IDs from Chosen_practice sheet")
+    return deal_ids
+
+async def restore_reminders_from_sheets():
+    """Restore active reminders by reading deals from Google Sheets and checking HubSpot"""
+    if not GOOGLE_SHEETS_SPREADSHEET_ID:
+        logger.info("Google Sheets not configured, skipping reminder restoration")
+        return
+    
+    logger.info("Starting reminder restoration from Google Sheets...")
+    
+    # Read deal IDs from both sheets
+    try:
+        deals_ids = get_deal_ids_from_sheet()
+        chosen_practice_ids = get_chosen_practice_deal_ids_from_sheet()
+    except Exception:
+        logger.exception("Failed to read deal IDs from Google Sheets, skipping reminder restoration")
+        return
+    
+    # Calculate candidates: deals that are in Deals but not in Chosen_practice
+    candidates = deals_ids - chosen_practice_ids
+    logger.info("Found %d candidate deals for reminder restoration (out of %d total deals)", len(candidates), len(deals_ids))
+    
+    if not candidates:
+        logger.info("No candidate deals found, skipping reminder restoration")
+        return
+    
+    # Check each candidate deal in HubSpot
+    restored_count = 0
+    skipped_count = 0
+    error_count = 0
+    
+    for deal_id in candidates:
+        # Skip if reminder already active (prevent duplicates)
+        if deal_id in _ACTIVE_REMINDERS:
+            logger.debug("Reminder already active for deal %s, skipping", deal_id)
+            skipped_count += 1
+            continue
+        
+        try:
+            # Fetch deal from HubSpot
+            deal = hs_get_deal(deal_id)
+            properties = deal.get("properties", {})
+            
+            # Check distribution flag
+            flag_value = properties.get(DISTRIBUTION_FLAG_PROP)
+            should_remind = False
+            if isinstance(flag_value, bool):
+                should_remind = flag_value is True
+            elif isinstance(flag_value, str):
+                should_remind = flag_value.strip().lower() == "true"
+            
+            if not should_remind:
+                logger.debug("Distribution flag is false for deal %s, skipping", deal_id)
+                skipped_count += 1
+                continue
+            
+            # Check main practice status
+            mp_value = properties.get(MAIN_PRACTICE_PROP)
+            mp_is_set = False
+            if mp_value is None:
+                mp_is_set = False
+            elif isinstance(mp_value, str):
+                mp_is_set = bool(mp_value.strip())
+            else:
+                mp_is_set = bool(mp_value)
+            
+            if mp_is_set:
+                logger.debug("Main practice is already set for deal %s, skipping", deal_id)
+                skipped_count += 1
+                continue
+            
+            # Check owner_id
+            owner_id_value = properties.get(DEAL_OWNER_PROP)
+            if not owner_id_value:
+                logger.debug("No owner set for deal %s, skipping", deal_id)
+                skipped_count += 1
+                continue
+            
+            # All conditions met - restore reminder
+            portal_id = str(deal.get("portalId") or "").strip() or None
+            asyncio.create_task(schedule_owner_reminder(deal_id, owner_id_value, portal_id))
+            logger.info("Restored reminder for deal %s (owner: %s)", deal_id, owner_id_value)
+            restored_count += 1
+            
+        except HTTPException as e:
+            logger.warning("Failed to fetch deal %s from HubSpot (HTTP %s), skipping", deal_id, e.status_code)
+            error_count += 1
+        except Exception:
+            logger.exception("Failed to restore reminder for deal %s, skipping", deal_id)
+            error_count += 1
+    
+    logger.info("Reminder restoration completed: %d restored, %d skipped, %d errors", restored_count, skipped_count, error_count)
+
 async def interest_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         query = update.callback_query
@@ -217,12 +392,12 @@ async def interest_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if first_time:
                 append_interest_row_to_sheet([deal_id, ts, alias])
             # Only toast, no extra message
-            await query.answer(text=("Интерес зафиксирован" if first_time else "Вы уже отмечались"), show_alert=False)
+            await query.answer(text=("Interest recorded" if first_time else "You already marked interest"), show_alert=False)
         elif data.startswith("list:"):
             deal_id = data.split(":", 1)[1]
             users = _INTEREST_USERS.get(deal_id, set())
             if not users:
-                await query.answer(text="Пока никто не отметил интерес", show_alert=True)
+                await query.answer(text="No one has marked interest yet", show_alert=True)
                 return
             # Format user list for popup
             user_list = []
@@ -242,7 +417,7 @@ async def interest_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     user_list.append(f"• ID: {user_id}")
             # Get deal name from cache or use ID as fallback
             deal_name = _DEAL_NAMES.get(deal_id, deal_id)
-            text = f"Интересуются по сделке {deal_name}:\n" + "\n".join(user_list)
+            text = f"Interested in deal {deal_name}:\n" + "\n".join(user_list)
             # Limit popup text length (Telegram has limits)
             if len(text) > 200:
                 text = text[:197] + "..."
@@ -489,7 +664,7 @@ async def schedule_owner_reminder(deal_id: str, owner_id: Any, portal_id: Option
                 deal_link = f"https://app.hubspot.com/contacts/{pid}/record/0-3/{deal_id}"
             else:
                 deal_link = f"deal id: {deal_id}"
-            text = f"{mention} напоминаю, что необходимо определить основной пул по сделке\n{deal_link}"
+            text = f"{mention} reminder: you need to determine the main practice for the deal\n{deal_link}"
             
             try:
                 await application.bot.send_message(
@@ -702,6 +877,9 @@ async def on_startup():
     await application.bot.set_webhook(url=f"{TELEGRAM_WEBHOOK_URL}")
     await application.initialize()
     await application.start()
+    
+    # Restore reminders from Google Sheets
+    await restore_reminders_from_sheets()
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -776,7 +954,7 @@ async def hubspot_webhook(request: Request):
             if mp_is_set:
                 title = properties.get("dealname", "(no title)")
                 deal_link = f"https://app.hubspot.com/contacts/24115553/record/0-3/{deal_id}"
-                text = f"Для сделки {title} определен основной пул: {mp_value}\n{deal_link}"
+                text = f"Main practice set for deal {title}: {mp_value}\n{deal_link}"
                 
                 # Cancel any active reminder tasks for this deal
                 cancel_deal_reminders(deal_id)
@@ -828,28 +1006,28 @@ async def hubspot_webhook(request: Request):
                 logger.exception("Failed to fetch primary company for deal %s", deal_id)
 
             lines = [
-                f"📌 Название сделки: {title}",
+                f"📌 Deal name: {title}",
                 f"ID: <a href=\"https://app.hubspot.com/contacts/24115553/record/0-3/{deal_id}\">{deal_id}</a>",
             ]
             if company_name:
-                lines.append(f"Компания: {company_name}")
+                lines.append(f"Company: {company_name}")
 
-            # label -> internal property name (russian labels)
+            # label -> internal property name
             fields_to_render = [
-                ("Стадия сделки", "dealstage"),
-                ("Сумма сделки", "amount"),
-                ("Владелец сделки", DEAL_OWNER_PROP),
-                ("Локация", DEAL_LOCATION_PROP),
-                ("Источник сделки", "source_of_deal"),
-                ("Описание сделки", "description"),
-                ("Дата старта", "closedate"),
-                ("Продолжительность проекта", "duration"),
-                ("Формат проекта", "onsight_remote"),
-                ("Финансовые условия", "financial_terms"),
-                ("Следующие шаги", "hs_next_step"),
-                ("Оповестить", "to_notify"),
-                ("Ссылка на документы", "rfp___docs"),
-                ("Комментарии", "description_of_deal"),
+                ("Deal stage", "dealstage"),
+                ("Deal amount", "amount"),
+                ("Deal owner", DEAL_OWNER_PROP),
+                ("Location", DEAL_LOCATION_PROP),
+                ("Deal source", "source_of_deal"),
+                ("Description", "description"),
+                ("Start date", "closedate"),
+                ("Project duration", "duration"),
+                ("Project format", "onsight_remote"),
+                ("Financial terms", "financial_terms"),
+                ("Next steps", "hs_next_step"),
+                ("Notify", "to_notify"),
+                ("Documents link", "rfp___docs"),
+                ("Comments", "description_of_deal"),
             ]
 
             for label, prop_key in fields_to_render:
@@ -887,11 +1065,11 @@ async def hubspot_webhook(request: Request):
             # Append to Google Sheet in the same order as the posted fields
             try:
                 row_values: list[Any] = []
-                # Название сделки, ID, Компания
+                # Deal name, ID, Company
                 row_values.append(title)
                 row_values.append(deal_id)
                 row_values.append(company_name or "")
-                # Стадия сделки -> ... -> Комментарии
+                # Deal stage -> ... -> Comments
                 order_props = [
                     "dealstage",
                     "amount",
