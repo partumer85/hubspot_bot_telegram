@@ -51,6 +51,14 @@ GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
 GOOGLE_SHEETS_SPREADSHEET_ID = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID", "")
 GOOGLE_SHEETS_SHEET_NAME = os.getenv("GOOGLE_SHEETS_SHEET_NAME", "Deals")
 
+# Weekly deal report settings
+WEEKLY_REPORT_ENABLED = os.getenv("WEEKLY_REPORT_ENABLED", "true").strip().lower() not in ("0", "false", "no", "")
+WEEKLY_REPORT_URL = os.getenv(
+    "WEEKLY_REPORT_URL",
+    "https://docs.google.com/spreadsheets/d/1dyURHZ8msYXCnyOfckynMUdStmpr9de6MEDQxBD92v8/edit?gid=29803331#gid=29803331",
+)
+WEEKLY_REPORT_TEST_MINUTES = int(os.getenv("WEEKLY_REPORT_TEST_MINUTES", "0"))
+
 # Cache for HubSpot owners: owner_id -> "First Last" (fallbacks to email/id)
 _OWNERS_MAP_CACHE: Dict[str, str] = {}
 _OWNERS_MAP_TS: float = 0.0
@@ -549,6 +557,74 @@ def render_dealstage(raw_value: Any) -> str:
     return key
 
 MSK_TZ = ZoneInfo("Europe/Moscow")
+BERLIN_TZ = ZoneInfo("Europe/Berlin")
+
+def build_weekly_report_message_text() -> str:
+    return (
+        "Hello!\n"
+        "Here's the HubSpot deal update for the last week\n"
+        "(what moved, what closed, what's new).\n"
+        "\n"
+        f'<a href="{WEEKLY_REPORT_URL}">View report</a>'
+    )
+
+async def send_weekly_report_message():
+    if TELEGRAM_CHAT_ID == 0:
+        logger.error("Cannot send weekly report: TELEGRAM_CHAT_ID is not set")
+        return
+    try:
+        await application.bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=build_weekly_report_message_text(),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        logger.info("Sent weekly report message")
+    except Exception:
+        logger.exception("Failed to send weekly report message")
+
+def next_weekly_report_berlin(now: Optional[datetime] = None) -> datetime:
+    """Return the next Monday 12:00 in Europe/Berlin."""
+    if now is None:
+        now = datetime.now(BERLIN_TZ)
+    else:
+        now = now.astimezone(BERLIN_TZ)
+    target = now.replace(hour=12, minute=0, second=0, microsecond=0)
+    if now.weekday() == 0 and now < target:
+        return target
+    if now.weekday() == 0:
+        return target + timedelta(days=7)
+    days_ahead = (0 - now.weekday()) % 7
+    return (now + timedelta(days=days_ahead)).replace(hour=12, minute=0, second=0, microsecond=0)
+
+async def weekly_report_loop():
+    if not WEEKLY_REPORT_ENABLED:
+        logger.info("Weekly report is disabled, skipping scheduler")
+        return
+    first_run = True
+    while True:
+        try:
+            if first_run and WEEKLY_REPORT_TEST_MINUTES > 0:
+                delay = WEEKLY_REPORT_TEST_MINUTES * 60
+                logger.info("Scheduling test weekly report in %s seconds", delay)
+                first_run = False
+            else:
+                trigger = next_weekly_report_berlin()
+                now_utc = datetime.now(ZoneInfo("UTC"))
+                delay = max(0, (trigger.astimezone(ZoneInfo("UTC")) - now_utc).total_seconds())
+                logger.info(
+                    "Scheduling weekly report at %s Berlin (in %s seconds)",
+                    trigger.isoformat(),
+                    int(delay),
+                )
+                first_run = False
+            await asyncio.sleep(delay)
+            await send_weekly_report_message()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Weekly report loop error; retrying in 1 hour")
+            await asyncio.sleep(3600)
 
 def format_date_yyyy_mm_dd(value: Any) -> str:
     if value is None:
@@ -860,6 +936,15 @@ Match: {'✅' if chat_id == TELEGRAM_CHAT_ID else '❌'}"""
 
 application.add_handler(CommandHandler("getchatid", getchatid_cmd))
 
+async def testweekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await send_weekly_report_message()
+        await update.message.reply_text("✅ Sent weekly report preview to channel")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed: {e}")
+
+application.add_handler(CommandHandler("testweekly", testweekly_cmd))
+
 application.add_handler(CallbackQueryHandler(interest_callback))
 
 class HubSpotEvent(BaseModel):
@@ -880,6 +965,8 @@ async def on_startup():
     
     # Restore reminders from Google Sheets
     await restore_reminders_from_sheets()
+
+    asyncio.create_task(weekly_report_loop())
 
 @app.on_event("shutdown")
 async def on_shutdown():
